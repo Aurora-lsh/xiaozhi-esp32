@@ -1,0 +1,6 @@
+fastmcp>=2.0
+openai>=1.0
+opencv-python>=4.8
+python-dotenv>=1.0
+requests>=2.31
+websockets>=11.0

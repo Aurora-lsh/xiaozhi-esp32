@@ -292,7 +292,7 @@ def _mimo_client() -> OpenAI:
 
 def _mimo_completion(media_content: dict[str, Any], question: str) -> str:
     model = os.getenv("MIMO_MODEL", "mimo-v2.5").strip()
-    max_tokens = _env_int("MIMO_MAX_COMPLETION_TOKENS", 512, 1, 4096)
+    max_tokens = _env_int("MIMO_MAX_COMPLETION_TOKENS", 1024, 1, 4096)
     completion = _mimo_client().chat.completions.create(
         model=model,
         messages=[
@@ -313,10 +313,41 @@ def _mimo_completion(media_content: dict[str, Any], question: str) -> str:
         ],
         max_completion_tokens=max_tokens,
     )
-    content = completion.choices[0].message.content
+
+    if not completion.choices:
+        LOGGER.error(
+            "MiMo returned no choices: request_id=%r model=%r usage=%r",
+            completion.id,
+            completion.model,
+            completion.usage,
+        )
+        raise RuntimeError("MiMo response did not contain any choices")
+
+    choice = completion.choices[0]
+    content = choice.message.content
+    reasoning_content = getattr(choice.message, "reasoning_content", None)
+    LOGGER.info(
+        "MiMo response: request_id=%r model=%r finish_reason=%r content=%r "
+        "usage=%r",
+        completion.id,
+        completion.model,
+        choice.finish_reason,
+        content,
+        completion.usage,
+    )
+    if reasoning_content:
+        LOGGER.debug("MiMo reasoning_content=%r", reasoning_content)
     if not isinstance(content, str) or not content.strip():
-        raise RuntimeError("MiMo response did not contain text")
-    return content
+        if reasoning_content:
+            LOGGER.warning(
+                "MiMo returned reasoning but no final text: reasoning_content=%r",
+                reasoning_content,
+            )
+        raise RuntimeError(
+            "MiMo response did not contain text "
+            f"(finish_reason={choice.finish_reason!r})"
+        )
+    return content.strip()
 
 
 def _analyze_mimo_image(jpeg: bytes, question: str) -> str:

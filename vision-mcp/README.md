@@ -44,7 +44,7 @@ VISION_API_STYLE=mimo
 MIMO_API_KEY=your-api-key
 MIMO_BASE_URL=https://api.xiaomimimo.com/v1
 MIMO_MODEL=mimo-v2.5
-MIMO_MAX_COMPLETION_TOKENS=512
+MIMO_MAX_COMPLETION_TOKENS=1024
 MIMO_VIDEO_ANALYSIS_FPS=2
 MIMO_MEDIA_RESOLUTION=default
 ```
@@ -106,6 +106,17 @@ Connected to the Xiaozhi MCP endpoint
 [camera-mcp] ... Processing request of type ListToolsRequest
 ```
 
+每次调用 MiMo 后，终端还会输出一条 `MiMo response` 日志，其中：
+
+- `content` 是视觉模型最终返回给小智的文本；
+- `finish_reason` 表示生成停止原因；
+- `usage` 是本次请求的 token 用量。
+
+这些诊断信息通过 stderr 输出，不会混入 MCP 的 JSON-RPC 标准输出。
+正常响应不会输出较长的 `reasoning_content`；只有最终文本为空时才输出它，便于排查
+输出额度等问题。桥接程序会强制本地 MCP 子进程使用 UTF-8，避免 Windows GBK 与
+UTF-8 混用导致中文日志或 MCP 返回内容乱码。
+
 可以对小智说：
 
 - “看一下摄像头前面有什么。”
@@ -115,11 +126,24 @@ Connected to the Xiaozhi MCP endpoint
 
 静态观察使用 `look_at_camera`；动作或时序观察使用 `watch_camera`。
 
+## WebSocket 连接故障
+
+如果程序反复重连并显示 `ConnectionResetError`，说明连接在 TLS/WebSocket 握手前
+被网络链路重置，还没有进入 MCP、摄像头或 MiMo 调用阶段。使用 Clash Verge、
+Mihomo 或其他 TUN/代理软件时，先重启代理核心或切换 TUN 模式，并确认
+`api.xiaozhi.me` 能正常直连；必要时为该域名添加 `DIRECT` 规则。端点 token 无效
+通常发生在 WebSocket 握手之后，不能解释 TLS 握手阶段的连接重置。
+
+桥接程序使用 `websockets` 的兼容客户端，以避免新 asyncio 实现在早期连接失败时
+额外抛出 `ClientConnection ... recv_messages`，掩盖真正的网络异常。在 Windows
+上还会使用 Selector 事件循环，并通过普通子进程和后台线程转发 stdio，以兼容
+Clash/Mihomo 等 TUN 网络环境下的 TLS 连接。
+
 ## 与官方 mcp-calculator 的关系
 
 `camera_mcp.py` 对应示例中的 `calculator.py`，`xiaozhi_mcp_bridge.py` 对应
 `mcp_pipe.py`。目录中的 `mcp_config.json` 也可以交给官方 `mcp_pipe.py` 使用。
 
 由于小智 MCP 返回内容通常较短，本工具不会通过 MCP 返回原始图片或 Base64，
-而是返回最多 800 个字符的视觉分析结果。图片只发送到你配置的 `VISION_URL`，不会
-保存在本地文件中。
+而是返回最多 800 个字符的视觉分析结果。图片会保存在本目录的 `data/` 中，并发送到
+当前配置的视觉服务。

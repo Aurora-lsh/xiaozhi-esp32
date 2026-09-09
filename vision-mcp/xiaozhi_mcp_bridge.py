@@ -6,10 +6,12 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+import subprocess
 import sys
+from typing import BinaryIO
 
 from dotenv import load_dotenv
-import websockets
+from websockets.legacy.client import connect
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,61 +28,76 @@ INITIAL_BACKOFF_SECONDS = 1
 MAX_BACKOFF_SECONDS = 600
 
 
-async def _websocket_to_process(websocket, process: asyncio.subprocess.Process) -> None:
+def _write_process_line(stream: BinaryIO, data: bytes) -> None:
+    stream.write(data)
+    stream.flush()
+
+
+async def _websocket_to_process(
+    websocket, process: subprocess.Popen[bytes]
+) -> None:
     assert process.stdin is not None
     async for message in websocket:
         if isinstance(message, bytes):
             message = message.decode("utf-8")
-        process.stdin.write((message + "\n").encode("utf-8"))
-        await process.stdin.drain()
+        await asyncio.to_thread(
+            _write_process_line, process.stdin, (message + "\n").encode("utf-8")
+        )
     raise RuntimeError("Xiaozhi MCP WebSocket closed")
 
 
-async def _process_to_websocket(process: asyncio.subprocess.Process, websocket) -> None:
+async def _process_to_websocket(
+    process: subprocess.Popen[bytes], websocket
+) -> None:
     assert process.stdout is not None
     while True:
-        line = await process.stdout.readline()
+        line = await asyncio.to_thread(process.stdout.readline)
         if not line:
             raise RuntimeError("camera MCP process stopped")
         await websocket.send(line.decode("utf-8").rstrip("\r\n"))
 
 
-async def _log_process_stderr(process: asyncio.subprocess.Process) -> None:
+async def _log_process_stderr(process: subprocess.Popen[bytes]) -> None:
     assert process.stderr is not None
     while True:
-        line = await process.stderr.readline()
+        line = await asyncio.to_thread(process.stderr.readline)
         if not line:
             return
         LOGGER.info("[camera-mcp] %s", line.decode("utf-8", errors="replace").rstrip())
 
 
-async def _stop_process(process: asyncio.subprocess.Process) -> None:
-    if process.returncode is not None:
+async def _stop_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
         return
     process.terminate()
     try:
-        await asyncio.wait_for(process.wait(), timeout=5)
-    except asyncio.TimeoutError:
+        await asyncio.to_thread(process.wait, 5)
+    except subprocess.TimeoutExpired:
         process.kill()
-        await process.wait()
+        await asyncio.to_thread(process.wait)
 
 
 async def _run_connected(endpoint: str) -> None:
     LOGGER.info("Connecting to the Xiaozhi MCP endpoint")
-    async with websockets.connect(
+    # The legacy asyncio client avoids a websockets 15+ cleanup bug that can
+    # mask an early TLS reset with "recv_messages" AttributeError.
+    async with connect(
         endpoint,
         ping_interval=20,
         ping_timeout=20,
         max_size=2 * 1024 * 1024,
     ) as websocket:
         LOGGER.info("Connected to the Xiaozhi MCP endpoint")
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            str(BASE_DIR / "camera_mcp.py"),
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+        child_env = os.environ.copy()
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
+        process = subprocess.Popen(
+            [sys.executable, str(BASE_DIR / "camera_mcp.py")],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             cwd=str(BASE_DIR),
+            env=child_env,
         )
 
         tasks = [
@@ -116,15 +133,20 @@ async def main() -> None:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            LOGGER.warning("Connection stopped: %s", error)
+            LOGGER.warning(
+                "Connection stopped: %s: %r", type(error).__name__, error
+            )
             LOGGER.info("Reconnecting in %d seconds", backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
 
 
 if __name__ == "__main__":
+    if sys.platform == "win32":
+        # Proactor TLS handshakes can be reset by some Windows TUN adapters.
+        # Pipe I/O uses regular Popen + worker threads, so Selector is safe here.
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         LOGGER.info("Stopped by user")
-

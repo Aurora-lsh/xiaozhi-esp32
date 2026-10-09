@@ -1,0 +1,4 @@
+fastmcp>=2.0,<5
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+websockets>=11,<16

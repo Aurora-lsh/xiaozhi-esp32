@@ -50,7 +50,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 $Root       = Split-Path -Parent $MyInvocation.MyCommand.Path
-$BuildDir   = Join-Path $Root "build_out"
+$BuildDir   = Join-Path $Root "temporary/build_out"
 $Fqbn       = "esp32:esp32:esp32cam"
 $ProjectName= "CameraWebServer"
 $PartitionCsv = Join-Path $Root "partitions.csv"
@@ -230,7 +230,7 @@ if (-not $SkipCompile) {
     )
     Write-Ok "编译完成"
 } else {
-    Write-Step "跳过编译，使用 build_out 中已有产物"
+    Write-Step "跳过编译，使用 temporary/build_out 中已有产物"
 }
 
 # --- 3. 检查产物 -----------------------------------------------------------

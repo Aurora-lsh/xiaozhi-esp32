@@ -1,0 +1,5 @@
+#pragma once
+
+#define MCP_BRIDGE_DEFAULT_IP "192.168.1.100"
+#define MCP_BRIDGE_PORT 8765
+#define MCP_REGISTRATION_KEY "replace-with-the-same-key-as-mcp-server"

@@ -14,17 +14,20 @@ from dotenv import load_dotenv
 
 try:
     from .esp32_client import Esp32VisionClient
+    from .camera_registration import resolve_camera_url, start_registration_from_env
 except ImportError:
     from esp32_client import Esp32VisionClient
+    from camera_registration import resolve_camera_url, start_registration_from_env
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env", encoding="utf-8-sig")
 LOGGER = logging.getLogger("ESP32Camera")
 _CLIENT = Esp32VisionClient(
-    os.getenv("ESP32_BASE_URL", "http://10.224.68.170"),
+    resolve_camera_url(),
     float(os.getenv("ESP32_TIMEOUT_SECONDS", "100")),
     # 手机热点会出现数秒级瞬时黑洞，连接超时放宽到 8 秒（旧值写死 3 秒）。
     float(os.getenv("ESP32_CONNECT_TIMEOUT_SECONDS", "8")),
+    base_url_provider=resolve_camera_url,
 )
 _LOCK = threading.Lock()
 _NOTE = "视觉模型使用每次请求的问题，并要求最终回答不超过30字。"
@@ -67,7 +70,8 @@ def look_at_camera(question: str) -> dict:
         result = _capture(question)
         result.update(question=question, prompt_note=_NOTE)
         # The firmware already stores the JPEG and shows it on the vision page.
-        result["web_url"] = _CLIENT.base_url + "/vision" if hasattr(_CLIENT, "base_url") else ""
+        address = resolve_camera_url()
+        result["web_url"] = address + "/vision" if address else ""
         LOGGER.info("look_at_camera completed in %.2fs", time.monotonic() - start)
         return result
     except Exception as error:
@@ -151,4 +155,11 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     # show_banner=False：FastMCP 的 ASCII 横幅会走 stderr，被桥接逐行转发到
     # 固件日志环形缓冲，把真正有用的日志挤掉，所以在固件场景下关闭它。
-    create_server().run(transport="stdio", show_banner=False)
+    registration = None
+    try:
+        if os.getenv("CAMERA_REGISTRATION_MANAGED_BY_BRIDGE") != "1":
+            registration = start_registration_from_env()
+        create_server().run(transport="stdio", show_banner=False)
+    finally:
+        if registration is not None:
+            registration.close()

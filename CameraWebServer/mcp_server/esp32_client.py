@@ -46,15 +46,18 @@ _CONNECT_RETRY_DELAY_SECONDS = 0.3
 
 
 class Esp32VisionClient:
-    def __init__(self, base_url, timeout=100.0, connect_timeout=8.0, session=None):
+    def __init__(self, base_url, timeout=100.0, connect_timeout=8.0, session=None,
+                 base_url_provider=None):
         url = urlsplit(base_url)
-        if url.scheme not in ("http", "https") or not url.hostname or url.query or url.fragment:
+        if not (not base_url and base_url_provider is not None) and (
+                url.scheme not in ("http", "https") or not url.hostname or url.query or url.fragment):
             raise ValueError("ESP32_BASE_URL must be an http(s) device URL")
         if not 1 <= float(timeout) <= 300:
             raise ValueError("ESP32_TIMEOUT_SECONDS must be between 1 and 300")
         if not 1 <= float(connect_timeout) <= 60:
             raise ValueError("ESP32_CONNECT_TIMEOUT_SECONDS must be between 1 and 60")
         self.base_url = base_url.rstrip("/")
+        self.base_url_provider = base_url_provider
         self.timeout = float(timeout)
         self.connect_timeout = float(connect_timeout)
         self.session = session if session is not None else requests.Session()
@@ -70,7 +73,10 @@ class Esp32VisionClient:
         连接阶段失败（DNS/建连失败或连接超时，请求必然还没发出）
         时重试一次；一旦判断请求可能已经发出就绝不重试，避免重复拍照。
         """
-        url = self.base_url + path
+        base_url = self.base_url_provider() if self.base_url_provider else self.base_url
+        if not base_url:
+            raise Esp32VisionError("等待 ESP32-CAM 上报 IP 地址，请确认设备联网且注册 key 一致")
+        url = base_url.rstrip("/") + path
         last_error = None
         for attempt in range(_CONNECT_ATTEMPTS):
             try:

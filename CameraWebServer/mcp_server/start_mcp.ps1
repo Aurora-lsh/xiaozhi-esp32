@@ -1,10 +1,11 @@
 ﻿$ErrorActionPreference = "Stop"
 $root = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+$env:PYTHONDONTWRITEBYTECODE = "1"
 $venvPython = Join-Path $root ".venv\Scripts\python.exe"
 
 if (-not (Test-Path -LiteralPath (Join-Path $root ".env"))) {
   Copy-Item -LiteralPath (Join-Path $root ".env.example") -Destination (Join-Path $root ".env")
-  Write-Host "已创建 mcp_server\.env，请先填写 MCP_ENDPOINT。"
+  Write-Host "已创建 mcp_server\.env，请填写 MCP_ENDPOINT 和与固件相同的 CAMERA_REGISTRATION_KEY。"
   exit 2
 }
 

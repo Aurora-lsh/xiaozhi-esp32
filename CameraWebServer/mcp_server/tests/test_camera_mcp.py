@@ -27,6 +27,18 @@ class CameraMcpTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertIn("duration_seconds", result["error"])
 
+    def test_camera_link_uses_current_registered_address(self):
+        fake = type("FakeClient", (), {
+            "base_url": "http://192.168.1.20",
+            "trigger_wait": lambda self, **kwargs: {
+                "finished": True, "success": True, "message": "杯子",
+            },
+        })()
+        with patch.object(camera_mcp, "_CLIENT", fake), patch.object(
+                camera_mcp, "resolve_camera_url", return_value="http://192.168.1.30"):
+            result = camera_mcp.look_at_camera("画面里有什么？")
+        self.assertEqual(result["web_url"], "http://192.168.1.30/vision")
+
 
 if __name__ == "__main__":
     unittest.main()

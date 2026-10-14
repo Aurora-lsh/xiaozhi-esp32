@@ -10,6 +10,11 @@ from urllib.parse import quote
 
 import requests
 
+try:
+    from .camera_registration import resolve_camera_url
+except ImportError:
+    from camera_registration import resolve_camera_url
+
 LOGGER = logging.getLogger("MCP_REPORT")
 _ENDPOINT_MAX = 90
 _DEFAULT_CONNECT_TIMEOUT = 8.0
@@ -31,7 +36,7 @@ def _connect_timeout():
 
 
 def _base_url():
-    return os.getenv("ESP32_BASE_URL", "").strip().rstrip("/")
+    return resolve_camera_url()
 
 
 _SESSION = None

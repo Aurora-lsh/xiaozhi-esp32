@@ -15,8 +15,10 @@ from websockets.legacy.client import connect
 
 try:
     from . import reporting
+    from .camera_registration import start_registration_from_env
 except ImportError:
     import reporting
+    from camera_registration import start_registration_from_env
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -145,13 +147,14 @@ async def _run_connected(endpoint: str, state: _BridgeState) -> None:
         await _push_log("小智 MCP 已连接", "info")
 
         child_env = os.environ.copy()
+        child_env["CAMERA_REGISTRATION_MANAGED_BY_BRIDGE"] = "1"
         child_env["PYTHONIOENCODING"] = "utf-8"
         child_env["PYTHONUTF8"] = "1"
         # FastMCP 的 rich 日志会折行并画框，转发到固件网页很难看；
         # 关掉后每个事件只占一行。
         child_env["FASTMCP_ENABLE_RICH_LOGGING"] = "false"
         process = subprocess.Popen(
-            [sys.executable, str(BASE_DIR / "camera_mcp.py")],
+            [sys.executable, "-B", str(BASE_DIR / "camera_mcp.py")],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -178,7 +181,7 @@ async def _run_connected(endpoint: str, state: _BridgeState) -> None:
             await _stop_process(process)
 
 
-async def main() -> None:
+async def _run_bridge() -> None:
     endpoint = os.getenv("MCP_ENDPOINT", "").strip()
     if not endpoint:
         raise RuntimeError("MCP_ENDPOINT is not configured in mcp_server/.env")
@@ -197,6 +200,15 @@ async def main() -> None:
             await _push_log("MCP 连接中断：%s，%d 秒后重连" % (type(error).__name__, backoff), "warn")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
+
+
+async def main() -> None:
+    registration = start_registration_from_env()
+    try:
+        await _run_bridge()
+    finally:
+        if registration is not None:
+            await asyncio.to_thread(registration.close)
 
 
 if __name__ == "__main__":

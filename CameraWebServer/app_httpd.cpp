@@ -24,6 +24,8 @@
 #include <stdlib.h>
 #include "vision.h"
 #include "mcp_status.h"
+#include "device_config.h"
+#include <ArduinoJson.h>
 
 #if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
 #include "esp32-hal-log.h"
@@ -1256,8 +1258,42 @@ static void url_decode(char *s)
     *w = '\0';
 }
 
+static esp_err_t provisioning_page_handler(httpd_req_t *req)
+{
+    if (!isDeviceProvisioningMode()) {
+        httpd_resp_set_status(req, "404 Not Found");
+        return httpd_resp_send(req, "配置热点未启用", HTTPD_RESP_USE_STRLEN);
+    }
+    static const char kProvisioningHtml[] = R"HTML(<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM 网络配置</title>
+<style>
+body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;margin:0;padding:16px;background:#eef2f6;color:#22303c}
+.card{max-width:620px;margin:24px auto;background:#fff;border-radius:12px;padding:22px;box-shadow:0 2px 10px #14283c18}
+h1{font-size:21px;margin:0 0 8px}p{color:#6f7f8d;font-size:13px}.row{display:flex;gap:10px;align-items:center;margin:14px 0;flex-wrap:wrap}.row label{width:130px;color:#4a5b6b}
+input[type=text],input[type=password]{flex:1;min-width:220px;padding:9px;border:1px solid #cfd9e2;border-radius:8px;font-size:15px}
+input[type=checkbox]{width:18px;height:18px}button{background:#2f7de1;color:#fff;border:0;border-radius:8px;padding:10px 16px;font-size:14px;cursor:pointer}.hint{font-size:13px;color:#6f7f8d;margin-top:12px}.err{color:#d9534f}
+</style></head><body><div class="card"><h1>ESP32-CAM 网络配置</h1>
+<p>连接开放热点 ESP32-CAM-7 后访问本页。填写家庭 Wi-Fi 和 MCP 上位机 IP，保存后重启设备。</p>
+<div class="row"><label for="ssid">Wi-Fi 名称</label><input id="ssid" type="text" maxlength="32" autocomplete="off"></div>
+<div class="row"><label for="pwd">Wi-Fi 密码</label><input id="pwd" type="password" maxlength="64" placeholder="留空表示不修改" autocomplete="new-password"></div>
+<div class="row"><label style="width:auto;display:flex;align-items:center;gap:8px"><input id="clearPwd" type="checkbox"> 清空密码（开放 Wi-Fi）</label></div>
+<div class="row"><label for="mcpIp">MCP 上位机 IP</label><input id="mcpIp" type="text" maxlength="15" inputmode="decimal" placeholder="例如 192.168.1.100"></div>
+<div class="row"><button onclick="saveConfig()">保存配置</button><button onclick="rebootDevice()">重启设备</button></div><div id="hint" class="hint">正在读取当前配置…</div>
+</div><script>
+const $=id=>document.getElementById(id);function show(text,error){$('hint').textContent=text;$('hint').className='hint'+(error?' err':'')}
+function load(){fetch('/device/config',{cache:'no-store'}).then(async r=>{const v=await r.json();if(!r.ok)throw Error(v.error||'读取失败');$('ssid').value=v.ssid||'';$('mcpIp').value=v.mcp_ip||'';show('配置已读取；密码不会回显。',false)}).catch(e=>show(e.message,true))}
+function saveConfig(){const payload={ssid:$('ssid').value,mcp_ip:$('mcpIp').value};if($('clearPwd').checked)payload.pwd='';else if($('pwd').value)payload.pwd=$('pwd').value;fetch('/device/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}).then(async r=>{const v=await r.json();if(!r.ok)throw Error(v.error||'保存失败');$('pwd').value='';$('clearPwd').checked=false;show('配置已保存，请点击“重启设备”。',false)}).catch(e=>show(e.message,true))}
+function rebootDevice(){show('正在请求重启…',false);fetch('/device/reboot',{method:'POST'}).then(async r=>{const v=await r.json();if(!r.ok)throw Error(v.error||'重启失败');show('设备即将重启，请等待其连接新 Wi-Fi。',false)}).catch(e=>show(e.message,true))}load();
+</script></body></html>)HTML";
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, kProvisioningHtml, HTTPD_RESP_USE_STRLEN);
+}
+
 static esp_err_t vision_page_handler(httpd_req_t *req)
 {
+    if (isDeviceProvisioningMode()) return provisioning_page_handler(req);
     static const char kVisionHtml[] = R"HTML(<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1282,6 +1318,8 @@ static esp_err_t vision_page_handler(httpd_req_t *req)
   button:disabled { background: #b8c4cf; cursor: not-allowed; }
   button.ghost { background: #eaf3ff; color: #2f7de1; }
   input[type=number] { width: 96px; padding: 8px 10px; font-size: 15px;
+           border: 1px solid #cfd9e2; border-radius: 8px; }
+  input[type=text], input[type=password] { width: min(360px, 100%); padding: 8px 10px; font-size: 15px;
            border: 1px solid #cfd9e2; border-radius: 8px; }
   input[type=checkbox] { width: 18px; height: 18px; }
   select { padding: 8px 10px; font-size: 15px; border: 1px solid #cfd9e2;
@@ -1350,6 +1388,16 @@ static esp_err_t vision_page_handler(httpd_req_t *req)
       <button id="btnTrigger" onclick="triggerOnce()">拍照并识别</button>
       <span id="statePill" class="pill">空闲</span>
     </div>
+  </div>
+
+  <div class="card">
+    <h2>网络配置</h2>
+    <div class="row"><label for="cfgSsid">Wi-Fi 名称</label><input type="text" id="cfgSsid" maxlength="32" autocomplete="off"></div>
+    <div class="row"><label for="cfgPwd">Wi-Fi 密码</label><input type="password" id="cfgPwd" maxlength="64" placeholder="留空表示不修改" autocomplete="new-password"></div>
+    <div class="row"><label for="cfgClearPwd">开放 Wi-Fi</label><input type="checkbox" id="cfgClearPwd"><span class="hint">勾选后清空已保存的 Wi-Fi 密码</span></div>
+    <div class="row"><label for="cfgMcpIp">MCP 上位机 IP</label><input type="text" id="cfgMcpIp" maxlength="15" placeholder="例如 192.168.1.100" inputmode="decimal"></div>
+    <div class="row"><button onclick="saveNetworkConfig()">保存网络配置</button><button class="ghost" onclick="rebootDevice()">重启应用配置</button></div>
+    <div class="hint" id="networkConfigHint">修改后先保存，再重启 ESP32-CAM；密码不会回显。</div>
   </div>
 
   <div class="card">
@@ -1521,6 +1569,40 @@ static esp_err_t vision_page_handler(httpd_req_t *req)
 
   window.torchLabel = function () { $('torchVal').textContent = torch.value; };
   window.qualityLabel = function () { $('qualityVal').textContent = quality.value; };
+
+  function networkHint(text, error) {
+    var hint = $('networkConfigHint');
+    hint.textContent = text;
+    hint.style.color = error ? '#d9534f' : '';
+  }
+
+  window.loadNetworkConfig = function () {
+    fetch('/device/config', { cache: 'no-store' })
+      .then(function (r) { return r.json().then(function (v) { if (!r.ok) throw new Error(v.error || '读取失败'); return v; }); })
+      .then(function (v) {
+        $('cfgSsid').value = v.ssid || '';
+        $('cfgMcpIp').value = v.mcp_ip || '';
+      })
+      .catch(function (e) { networkHint(e.message, true); });
+  };
+
+  window.saveNetworkConfig = function () {
+    var payload = { ssid: $('cfgSsid').value, mcp_ip: $('cfgMcpIp').value };
+    var password = $('cfgPwd').value;
+    if ($('cfgClearPwd').checked) payload.pwd = '';
+    else if (password.length > 0) payload.pwd = password;
+    fetch('/device/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), cache: 'no-store' })
+      .then(function (r) { return r.json().then(function (v) { if (!r.ok) throw new Error(v.error || '保存失败'); return v; }); })
+      .then(function () { $('cfgPwd').value = ''; $('cfgClearPwd').checked = false; networkHint('配置已保存，请点击“重启应用配置”使 Wi-Fi 和 MCP 地址生效。', false); })
+      .catch(function (e) { networkHint(e.message, true); });
+  };
+
+  window.rebootDevice = function () {
+    networkHint('正在请求重启…', false);
+    fetch('/device/reboot', { method: 'POST', cache: 'no-store' })
+      .then(function (r) { if (!r.ok) throw new Error('重启请求失败，请重试'); networkHint('设备即将重启，请在串口查看新网页地址。', false); })
+      .catch(function (e) { networkHint(e.message, true); });
+  };
 
   function sizeText(v) {
     for (var i = 0; i < SIZES.length; i++) if (SIZES[i].v === v) return SIZES[i].t;
@@ -1805,16 +1887,106 @@ static esp_err_t vision_page_handler(httpd_req_t *req)
 
   refresh();
   mcpRefresh(true);
+  loadNetworkConfig();
 })();
 </script>
 </body>
 </html>)HTML";
 
     httpd_resp_set_type(req, "text/html; charset=utf-8");
-    // 页面本身是静态的（状态全部由 JS 拉取），允许浏览器缓存，省掉每次
-    // 重新传输 ~21KB HTML：在丢包链路上这一段正是“打开网页要很久”的主因。
-    httpd_resp_set_hdr(req, "Cache-Control", "max-age=3600");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
     return httpd_resp_send(req, kVisionHtml, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t device_json_response(httpd_req_t* req, const char* status, const JsonDocument& document)
+{
+    char body[512];
+    if (measureJson(document) >= sizeof(body)) return httpd_resp_send_500(req);
+    const size_t length = serializeJson(document, body, sizeof(body));
+    httpd_resp_set_status(req, status);
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, body, length);
+}
+
+static esp_err_t device_error_response(httpd_req_t* req, const char* status, const char* message)
+{
+    JsonDocument document;
+    document["success"] = false;
+    document["error"] = message;
+    return device_json_response(req, status, document);
+}
+
+static esp_err_t device_config_get_handler(httpd_req_t* req)
+{
+    const DeviceNetworkConfig config = getDeviceNetworkConfig();
+    JsonDocument document;
+    document["ssid"] = config.ssid;
+    document["mcp_ip"] = config.mcpIp;
+    document["pwdConfigured"] = config.pwd[0] != '\0';
+    return device_json_response(req, "200 OK", document);
+}
+
+static esp_err_t device_config_post_handler(httpd_req_t* req)
+{
+    if (req->content_len <= 0 || req->content_len > 512) {
+        return device_error_response(req, "400 Bad Request", "请求体必须为 1-512 字节的 JSON");
+    }
+    char contentType[64];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", contentType, sizeof(contentType)) != ESP_OK
+        || strncmp(contentType, "application/json", 16) != 0
+        || (contentType[16] != '\0' && contentType[16] != ';')) {
+        return device_error_response(req, "400 Bad Request", "请使用 application/json 提交配置");
+    }
+    char body[513];
+    size_t received = 0;
+    while (received < req->content_len) {
+        const int count = httpd_req_recv(req, body + received, req->content_len - received);
+        if (count <= 0) {
+            return device_error_response(req, "408 Request Timeout", "配置请求接收失败，请重试");
+        }
+        received += count;
+    }
+    body[received] = '\0';
+    JsonDocument document;
+    if (deserializeJson(document, body, received) || !document.is<JsonObject>()) {
+        return device_error_response(req, "400 Bad Request", "配置 JSON 格式错误");
+    }
+    const char* names[] = {"ssid", "pwd", "mcp_ip"};
+    bool hasParameter = false;
+    for (const char* name : names) {
+        if (document[name].isUnbound()) continue;
+        hasParameter = true;
+        if (!document[name].is<const char*>()) {
+            return device_error_response(req, "400 Bad Request", "配置项必须为字符串");
+        }
+        const JsonString text = document[name].as<JsonString>();
+        if (strlen(text.c_str()) != text.size() || !isValidDeviceNetworkParameter(name, text.c_str())) {
+            return device_error_response(req, "400 Bad Request", "SSID 为 1-32 字节，密码为 0-64 字节，MCP IP 必须为有效 IPv4");
+        }
+    }
+    if (!hasParameter) {
+        return device_error_response(req, "400 Bad Request", "缺少 ssid、pwd 或 mcp_ip 配置项");
+    }
+    for (const char* name : names) {
+        if (document[name].isUnbound()) continue;
+        if (setDeviceNetworkParameter(name, document[name].as<const char*>()) != DeviceConfigResult::Saved) {
+            return device_error_response(req, "503 Service Unavailable", "配置保存失败，部分参数可能已保存，请重新保存");
+        }
+    }
+    JsonDocument response;
+    response["success"] = true;
+    response["rebootRequired"] = true;
+    return device_json_response(req, "200 OK", response);
+}
+
+static esp_err_t device_reboot_handler(httpd_req_t* req)
+{
+    JsonDocument response;
+    response["success"] = true;
+    const esp_err_t result = device_json_response(req, "200 OK", response);
+    if (result == ESP_OK) requestDeviceRestart();
+    return result;
 }
 
 static uint8_t g_activeChannel(void)
@@ -2322,6 +2494,13 @@ void startCameraServer()
         .user_ctx = NULL
     };
 
+    httpd_uri_t config_page_uri = {
+        .uri = "/config",
+        .method = HTTP_GET,
+        .handler = provisioning_page_handler,
+        .user_ctx = NULL
+    };
+
     httpd_uri_t vision_uri = {
         .uri = "/vision",
         .method = HTTP_GET,
@@ -2386,6 +2565,27 @@ void startCameraServer()
         .uri = "/vision/wifi",
         .method = HTTP_GET,
         .handler = vision_wifi_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t device_config_get_uri = {
+        .uri = "/device/config",
+        .method = HTTP_GET,
+        .handler = device_config_get_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t device_config_post_uri = {
+        .uri = "/device/config",
+        .method = HTTP_POST,
+        .handler = device_config_post_handler,
+        .user_ctx = NULL
+    };
+
+    httpd_uri_t device_reboot_uri = {
+        .uri = "/device/reboot",
+        .method = HTTP_POST,
+        .handler = device_reboot_handler,
         .user_ctx = NULL
     };
 
@@ -2457,6 +2657,7 @@ void startCameraServer()
     {
         // 只注册视觉识别相关接口，不再启动镜像流服务
         httpd_register_uri_handler(camera_httpd, &root_uri);
+        httpd_register_uri_handler(camera_httpd, &config_page_uri);
         httpd_register_uri_handler(camera_httpd, &vision_uri);
         httpd_register_uri_handler(camera_httpd, &vision_status_uri);
         httpd_register_uri_handler(camera_httpd, &vision_image_uri);
@@ -2465,6 +2666,9 @@ void startCameraServer()
         httpd_register_uri_handler(camera_httpd, &vision_trigger_wait_uri);
         httpd_register_uri_handler(camera_httpd, &vision_config_uri);
         httpd_register_uri_handler(camera_httpd, &vision_wifi_uri);
+        httpd_register_uri_handler(camera_httpd, &device_config_get_uri);
+        httpd_register_uri_handler(camera_httpd, &device_config_post_uri);
+        httpd_register_uri_handler(camera_httpd, &device_reboot_uri);
         httpd_register_uri_handler(camera_httpd, &mcp_report_uri);
         httpd_register_uri_handler(camera_httpd, &mcp_report_get_uri);
         httpd_register_uri_handler(camera_httpd, &mcp_status_uri);

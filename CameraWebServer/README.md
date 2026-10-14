@@ -31,6 +31,8 @@ ESP32 → HTTP 响应 → 电脑桥接 → WebSocket → 小智
 
 ESP32 不直接实现 MCP 协议，而是提供普通 HTTP 接口。电脑桥接同时负责 WebSocket 长连接、stdio MCP 转发和局域网 HTTP 请求。
 
+ESP32 联网后主动向电脑的 `POST /camera/register` 上报自身 IP，电脑校验固定 key 后保存地址。摄像头 IP 变化后无需修改电脑配置；电脑 IP 变化时，通过 ESP32 串口修改桥接 IP 即可。
+
 ## 目录说明
 
 | 路径 | 作用 |
@@ -40,9 +42,12 @@ ESP32 不直接实现 MCP 协议，而是提供普通 HTTP 接口。电脑桥接
 | `vision_config.h` | 模型、API、分辨率、识别间隔和超时配置 |
 | `app_httpd.cpp` | 网页、视觉接口和 MCP 状态接口 |
 | `mcp_status.cpp` / `mcp_status.h` | MCP 状态、日志和抓拍事件缓存 |
+| `device_config.h` | 网页和串口共享网络配置、校验、存储与重启接口 |
 | `mcp_server/` | 电脑端 MCP 服务和小智 WebSocket 桥接 |
 | `build_flash.ps1` | 编译、烧录和可选串口监视 |
-| `build_out/` | 编译生成的固件产物 |
+| `mcp_registration.cpp` / `mcp_registration.h` | 带 key 的 IP 上报后台任务 |
+| `mcp_registration_config.h` | 本机私有默认桥接 IP、端口和固定 key |
+| `temporary/` | 编译产物、缓存和历史临时记录，详见目录内 README |
 
 ## 硬件与网络
 
@@ -58,7 +63,7 @@ USB-TTL RX  → ESP32-CAM U0T/TX
 IO0         → GND（仅烧录时）
 ```
 
-ESP32 需要连接 2.4 GHz Wi-Fi。Wi-Fi 名称和密码当前位于 `CameraWebServer.ino` 的 `ssid` 和 `password` 变量中，修改后必须重新编译烧录。
+ESP32 需要连接 2.4 GHz Wi-Fi。开机先尝试 NVS 已保存的 Wi-Fi（首次启动则尝试 `CameraWebServer.ino` 中的默认值）；约 20 秒仍未连接时会开启 `ESP32-CAM-7` 临时热点。Wi-Fi 配置保存到 NVS，掉电保留，无需为修改 Wi-Fi 重新编译。
 
 电脑运行 MCP 桥接时，电脑和 ESP32 必须能互相访问。先确认设备 IP，再在电脑执行：
 
@@ -66,6 +71,52 @@ ESP32 需要连接 2.4 GHz Wi-Fi。Wi-Fi 名称和密码当前位于 `CameraWebS
 ping <ESP32-IP>
 curl.exe --noproxy "*" http://<ESP32-IP>/mcp/status
 ```
+
+## 串口设置 Wi-Fi
+
+串口波特率为 **115200**。每条命令以换行结束，支持 LF、CR 和 CRLF：
+
+| 命令 | 作用 |
+| --- | --- |
+| `ssid=MyWiFi` | 设置并保存 Wi-Fi 名称（1–32 字节） |
+| `pwd=MyPassword123` | 设置并保存密码（最多 64 字节）；`pwd=` 为空密码，用于开放网络 |
+| `ssid?` | 查询配置中的 Wi-Fi 名称 |
+| `pwd?` | 查询配置中的密码，**明文显示** |
+| `mcp_ip=192.168.1.100` | 保存 MCP 桥接电脑的 IPv4 地址，重启应用 |
+| `mcp_ip?` | 查询配置中的桥接 IP |
+| `wifi_config` | 手动开启 ESP32-CAM-7 开放配置热点，访问 `http://192.168.4.1/config` |
+| `reboot` | 重启设备，使用已保存的配置连接 |
+| `help` | 查看串口命令帮助，原有识别和诊断命令保留 |
+
+设备初始化完成后，串口会在启动日志末尾一次性输出完整命令列表；初始化失败时也会输出同一列表，便于直接修改 Wi-Fi 或桥接地址。发送 `help` 可再次显示，启动阶段不会重复输出。
+
+若当前设备已连接 Wi-Fi，发送 `wifi_config` 也可以主动进入开放热点配置模式；保存并重启后，STA 成功连接会自动关闭热点。
+
+正常联网初始化完成时，仍输出 `ESP32-CAM网页服务地址: http://<设备IP>/vision`，以及 `MCP上位机服务IP: <桥接电脑IP>:8765`，然后显示完整串口指令。
+
+示例（逐行发送，不要给值加引号）：
+
+```text
+ssid=MyWiFi
+pwd=MyPassword123
+ssid?
+pwd?
+reboot
+```
+
+设置成功返回 `CMD: ssid saved ...` 或 `CMD: pwd saved ...`；查询返回 `WIFI: ssid=...` 或 `WIFI: pwd=...`。命令关键字不区分大小写，值保留大小写、空格和 `=`，因此不要在值后附加多余空格。长度按 UTF-8 字节计算。
+
+配置设置后立即保存，但**不会立即重连**；两项设置完毕后发送 `reboot`，或手动复位/重新上电。查询显示的是待使用的配置，不一定是当前连接的网络。Wi-Fi 连接失败后仍可通过串口修改配置（启动连接最多等待 20 秒）。
+
+密码会存储到设备并在 `pwd?` 中明文返回，串口日志不要公开。普通复位/断电不会清除配置；**整片擦除 Flash 会清除配置**。本项目烧录脚本默认整片擦除，再次烧录如需保留配置，请加 `-NoErase`，且不要更改 NVS 分区位置。
+
+## 首次 Wi-Fi 配置热点
+
+首次启动或保存的 Wi-Fi 连不上时，ESP32-CAM 在等待约 20 秒后会开启**无密码热点 `ESP32-CAM-7`**。用手机或电脑连接它，然后打开 `http://192.168.4.1/config`。在页面填写 Wi-Fi 名称、密码和 MCP 上位机 IP，保存后点击“重启设备”。
+
+密码留空表示保留原密码；切换到开放 Wi-Fi 时勾选“清空密码”。配置与串口设置写入同一份 NVS，掉电保留。连接上 Wi-Fi 后会自动关闭开放热点，并向电脑上位机上报摄像头 IP。
+
+电脑上位机只负责接收摄像头的 IP 注册和转发 MCP 请求，不提供设备配置页面。电脑 IP 变化时可在已联网设备网页配置，也可继续通过串口命令 `mcp_ip=<电脑IPv4>` 修改。
 
 ## 固件配置
 
@@ -147,12 +198,30 @@ powershell -ExecutionPolicy Bypass -File .\build_flash.ps1 -Port COM9 -SkipCompi
 
 ```powershell
 cd .\mcp_server
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 notepad .env
 .\start_mcp.ps1
 ```
 
 启动成功后，日志中应看到 `Connected to the Xiaozhi MCP endpoint`。电脑桥接进程必须保持运行；停止服务时在该窗口按 `Ctrl+C`。
+
+## 动态地址注册配置
+
+本机已配对 `mcp_server/.env` 中的 `CAMERA_REGISTRATION_KEY` 和 `mcp_registration_config.h` 中的 `MCP_REGISTRATION_KEY`。桥接默认监听 `0.0.0.0:8765`，当前固件默认桥接 IP 为 `192.168.240.247`；该默认值只在设备未保存地址时使用。
+
+在 115200 波特率的串口监视器中逐行发送：
+
+```text
+mcp_ip=192.168.240.247
+mcp_ip?
+reboot
+```
+
+电脑更换网络后，将第一行替换为电脑在 ESP32 所在局域网中的新 IPv4 地址。配置保存在 NVS，掉电保留；查询显示待应用的地址，重启后上报任务使用新地址。烧录时使用 `-NoErase` 可保留 Wi-Fi 和桥接 IP。
+
+迁移到另一台电脑时，将 `mcp_registration_config.h.example` 复制为 `mcp_registration_config.h`，并填写与服务端一致的固定 key 和端口。IP 可随后通过串口设置，无需重新编译。服务端 `ESP32_BASE_URL` 留空即可完全使用自动注册，也可填写地址兼容旧固件。
+
+设备联网和 IP 变化时立即上报，失败后每 5 秒重试，成功后每 60 秒重报。HTTP 请求由独立任务执行，栈大小为 4096 字节，连接和响应超时各 1.5 秒；桥接重启后最多等待一轮重报即可自动恢复。电脑需允许 ESP32 访问 TCP 8765，双方应位于可互访的局域网。
 
 ## 安全注意事项
 
@@ -172,7 +241,7 @@ ping <ESP32-IP>
 curl.exe --noproxy "*" http://<ESP32-IP>/mcp/status
 ```
 
-如果电脑切换了热点，ESP32 的 IP 可能已经变化，需要同步修改 `mcp_server/.env` 的 `ESP32_BASE_URL`。
+摄像头 IP 变化后会自动上报并更新桥接地址。若电脑 IP 变化，通过串口发送 `mcp_ip=新的电脑IP`，再发送 `reboot`。若一直等待注册，检查两端 key、桥接监听端口及电脑防火墙入站设置。
 
 ### 日志出现“ESP32 请求失败或超时”
 
@@ -194,7 +263,11 @@ curl.exe --noproxy "*" http://<ESP32-IP>/mcp/status
 
 ```powershell
 $env:PYTHONPATH = (Get-Location).Path
-& .\mcp_server\.venv\Scripts\python.exe -B -m unittest mcp_server.tests.test_esp32_client mcp_server.tests.test_camera_mcp mcp_server.tests.test_firmware_interval_config -v
+& .\mcp_server\.venv\Scripts\python.exe -B -m unittest discover -s mcp_server/tests -v
+& .\mcp_server\.venv\Scripts\python.exe -B tests/run_serial_wifi_tests.py
+& .\mcp_server\.venv\Scripts\python.exe -B tests/run_registration_tests.py
+& .\mcp_server\.venv\Scripts\python.exe -B tests/run_device_http_tests.py
+node tests/web_network_config_tests.cjs
 ```
 
 固件只编译验证：

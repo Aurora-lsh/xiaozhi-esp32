@@ -17,8 +17,8 @@ $cli  = 'D:\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe'
 $fqbn = 'esp32:esp32:esp32cam'
 
 if (-not (Test-Path -LiteralPath $cli)) { throw "找不到 arduino-cli: $cli" }
-if (-not (Test-Path -LiteralPath (Join-Path $root 'build_out\CameraWebServer.ino.bin'))) {
-    throw "未找到编译产物，请先执行：arduino-cli compile --fqbn $fqbn --output-dir build_out ."
+if (-not (Test-Path -LiteralPath (Join-Path $root 'temporary/build_out\CameraWebServer.ino.bin'))) {
+    throw "未找到编译产物，请先执行：arduino-cli compile --fqbn $fqbn --output-dir temporary/build_out ."
 }
 
 Write-Host "目标端口 : $Port"
@@ -29,11 +29,11 @@ Write-Host ""
 # 分区表已改为 huge_app 布局，首次烧录前擦除整片，避免残留 nvs/ota 数据
 if (-not $NoErase) {
     Write-Host '==> 擦除 flash ...'
-    & $cli upload -p $Port -b $fqbn --input-dir (Join-Path $root 'build_out') `
+    & $cli upload -p $Port -b $fqbn --input-dir (Join-Path $root 'temporary/build_out') `
          --upload-field EraseFlash=all -v
 } else {
     Write-Host '==> 直接烧录 ...'
-    & $cli upload -p $Port -b $fqbn --input-dir (Join-Path $root 'build_out') -v
+    & $cli upload -p $Port -b $fqbn --input-dir (Join-Path $root 'temporary/build_out') -v
 }
 
 if ($LASTEXITCODE -ne 0) { throw "烧录失败 (exit=$LASTEXITCODE)" }

@@ -1,0 +1,5 @@
+temporary/
+build_out/
+mcp_registration_config.h
+__pycache__/
+*.pyc

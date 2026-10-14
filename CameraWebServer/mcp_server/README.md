@@ -30,6 +30,8 @@ ESP32-CAM
 | `camera_mcp.py` | 提供 `look_at_camera` 和 `watch_camera` 两个 MCP 工具 |
 | `esp32_client.py` | ESP32 HTTP 客户端、状态轮询、请求超时和连接重试 |
 | `reporting.py` | 把桥接状态和日志回传到 ESP32 网页，失败不影响 MCP 调用 |
+| `camera_registration.py` | 校验 key、接收摄像头 IP，原子保存并供父子进程共享 |
+| `runtime/camera_address.json` | 最近认证通过的摄像头地址，服务重启后继续使用 |
 | `start_mcp.ps1` | 创建虚拟环境、安装依赖并启动桥接 |
 | `.env.example` | 配置模板 |
 | `.env` | 本机真实配置，不要公开或提交 |
@@ -57,7 +59,7 @@ $env:PYTHON_EXE = 'D:\Python\cpython-3.11.13-windows-x86_64-none\python.exe'
 在本目录创建 `.env`：
 
 ```powershell
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 notepad .env
 ```
 
@@ -65,7 +67,10 @@ notepad .env
 
 ```dotenv
 MCP_ENDPOINT=wss://api.xiaozhi.me/mcp/?token=...
-ESP32_BASE_URL=http://192.168.137.135
+CAMERA_REGISTRATION_HOST=0.0.0.0
+CAMERA_REGISTRATION_PORT=8765
+CAMERA_REGISTRATION_KEY=replace-with-the-same-random-key-as-firmware
+ESP32_BASE_URL=
 ESP32_TIMEOUT_SECONDS=100
 ESP32_CONNECT_TIMEOUT_SECONDS=8
 WATCH_SAMPLE_INTERVAL_SECONDS=1
@@ -76,7 +81,11 @@ WATCH_SAMPLE_INTERVAL_SECONDS=1
 | 变量 | 默认值 | 说明 |
 | --- | ---: | --- |
 | `MCP_ENDPOINT` | 无 | 从小智平台获取的完整 WebSocket MCP endpoint，包含 token |
-| `ESP32_BASE_URL` | `http://10.224.68.170` | ESP32 当前局域网地址，不要带路径、查询参数或末尾接口 |
+| `CAMERA_REGISTRATION_HOST` | `0.0.0.0` | 注册接口监听地址，允许局域网设备访问 |
+| `CAMERA_REGISTRATION_PORT` | `8765` | 注册接口 TCP 端口，应与固件 `MCP_BRIDGE_PORT` 一致 |
+| `CAMERA_REGISTRATION_KEY` | 空 | 固定认证 key，与固件完全一致；为空时关闭注册接口 |
+| `CAMERA_STATE_FILE` | `mcp_server/runtime/camera_address.json` | 可选共享地址文件，相对路径以 mcp_server 为基准 |
+| `ESP32_BASE_URL` | 空 | 可选旧固件兼容地址；已认证的注册地址优先 |
 | `ESP32_TIMEOUT_SECONDS` | `100` | TCP 连接建立后，ESP32 HTTP 读响应及等待本轮识别完成的最长时间 |
 | `ESP32_CONNECT_TIMEOUT_SECONDS` | `8` | 建立 TCP 连接的最长等待时间，允许 1 到 60 秒 |
 | `WATCH_SAMPLE_INTERVAL_SECONDS` | `1` | `watch_camera` 连续快照之间的间隔，允许 0.1 到 10 秒 |
@@ -85,6 +94,28 @@ WATCH_SAMPLE_INTERVAL_SECONDS=1
 
 - 连接超时解决“电脑暂时连不上设备”的问题；
 - 识别超时解决“已经连上设备，但识别或模型响应很慢”的问题。
+
+## 摄像头地址自动注册
+
+桥接服务不提供设备配置页面，仅接收 ESP32-CAM 的 IP 注册并代理 MCP 摄像头请求。首次 Wi-Fi 配置由 ESP32-CAM 自带的 `ESP32-CAM-7` 无密码热点完成；连接热点后打开 `http://192.168.4.1/config`。
+
+在固件私有文件 `mcp_registration_config.h` 中配置相同的 `MCP_REGISTRATION_KEY`，以及注册端口 `MCP_BRIDGE_PORT`。本机这两处已填入同一个随机 key；已有配置无需再次复制模板。
+
+桥接电脑地址通过 ESP32 串口配置，115200 波特率，每行发送一条：
+
+```text
+mcp_ip=192.168.240.247
+mcp_ip?
+reboot
+```
+
+将示例 IP 替换为电脑在设备所在网络中的真实地址。设置写入 NVS，重启应用，掉电保留。电脑 IP 改变后重复这三行，无需重编固件。固定 key 和注册端口由编译配置提供。
+
+固件向 `http://<电脑IP>:8765/camera/register` 发送 POST，请求头 `X-Camera-Key` 携带 key，请求体为 `{"ip":"192.168.1.20"}`。返回 200 表示已保存地址；403 表示 key 不一致；400 表示数据无效；503 表示暂时无法保存或服务繁忙。失败后 5 秒重试，成功后 60 秒重报，Wi-Fi 重连或设备 IP 变化会立即再次上报。
+
+监听服务在小智 WebSocket 重连期间继续运行；MCP 请求和桥接状态回传都在每次请求前读取最新地址，无需重启进程。桥接重启后保留最新地址；修改 key 会使旧记录失效。未收到上报且没有兼容地址时，MCP 工具返回等待注册的说明。
+
+电脑需允许局域网设备访问 TCP 8765。注册服务最多处理 4 个并发连接，每个请求有 3 秒总时限。仅启动一个桥接实例；直接启动 `camera_mcp.py` 时也会启动同样的注册监听，不能与桥接同时占用此端口。
 
 连接阶段只自动重试一次，而且只重试确定尚未发出的请求。读超时、响应中途断开和已经发出的 `/vision/trigger_wait` 请求不会重试，避免一次语音调用触发多次拍照。
 
@@ -176,7 +207,7 @@ http://<ESP32-IP>/
 
 ## 网络检查
 
-先确认 `.env` 中的 `ESP32_BASE_URL`：
+先确认串口出现 `MCP: registered camera IP ...`，并查看 `runtime/camera_address.json` 中的摄像头 IP；旧固件兼容模式下则使用 `ESP32_BASE_URL`：
 
 ```powershell
 ping 192.168.137.135
@@ -206,7 +237,7 @@ uv --version
 按顺序检查：
 
 1. ESP32 是否已通电并连接当前热点；
-2. `ESP32_BASE_URL` 是否是最新 IP；
+2. 串口 `mcp_ip?` 是否是电脑当前地址，两端 key 是否一致；
 3. `ping` 和 `/mcp/status` 是否可达；
 4. Windows 防火墙或热点是否启用了客户端隔离；
 5. 是否有浏览器预览、识别请求或其他程序占满设备连接。
@@ -231,13 +262,17 @@ uv --version
 
 ```powershell
 $env:PYTHONPATH = (Get-Location).Path
-& .\mcp_server\.venv\Scripts\python.exe -B -m unittest mcp_server.tests.test_esp32_client mcp_server.tests.test_camera_mcp mcp_server.tests.test_firmware_interval_config -v
+& .\mcp_server\.venv\Scripts\python.exe -B -m unittest discover -s mcp_server/tests -v
+& .\mcp_server\.venv\Scripts\python.exe -B tests/run_serial_wifi_tests.py
+& .\mcp_server\.venv\Scripts\python.exe -B tests/run_registration_tests.py
+& .\mcp_server\.venv\Scripts\python.exe -B tests/run_device_http_tests.py
+node tests/web_network_config_tests.cjs
 ```
 
 直接检查 Python 语法：
 
 ```powershell
-& .\mcp_server\.venv\Scripts\python.exe -B -m py_compile .\mcp_server\*.py
+& .\mcp_server\.venv\Scripts\python.exe -B -c "import ast,pathlib; [ast.parse(p.read_text(encoding='utf-8-sig')) for p in pathlib.Path('mcp_server').glob('*.py')]"
 ```
 
 固件编译验证应在工程根目录执行：

@@ -3,7 +3,7 @@
     "esp32-vision-camera": {
       "type": "stdio",
       "command": "python",
-      "args": ["camera_mcp.py"]
+      "args": ["-B", "camera_mcp.py"]
     }
   }
 }

@@ -1,9 +1,15 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <Preferences.h>
 #include "esp_wifi.h"
 #include "vision.h"
 #include "mcp_status.h"
+#include "mcp_registration.h"
+#include "mcp_ip_validation.h"
+#include "device_config.h"
+#include "wifi_provisioning.h"
+#include <mutex>
 
 //
 // WARNING!!! PSRAM IC required for UXGA resolution and high JPEG quality
@@ -36,21 +42,198 @@
 //#define CAMERA_MODEL_DFRobot_Romeo_ESP32S3 // Has PSRAM
 #include "camera_pins.h"
 
-// ===========================
-// Enter your WiFi credentials
-// ===========================
-// const char* ssid = "realmeGTNeo";
-// const char* password = "qwertyui";
-const char* ssid = "123";
-const char* password = "s72ccjiy";
+// Defaults used only when no serial configuration has been saved.
+static const char* DEFAULT_WIFI_SSID = "123";
+static const char* DEFAULT_WIFI_PASSWORD = "s72ccjiy";
+static const char* WIFI_PREFS_NAMESPACE = "wifi";
+
+static String wifiSsid;
+static String wifiPassword;
+static String mcpBridgeIp;
+static bool cameraReady = false;
+static bool httpServerStarted = false;
+static bool mcpStatusStarted = false;
+static bool networkServicesStarted = false;
+static bool registrationStarted = false;
+static bool startupCommandsPrinted = false;
+static bool provisioningMode = false;
+static bool provisioningManual = false;
+static std::mutex deviceConfigMutex;
+static bool restartRequested = false;
+static unsigned long restartRequestedAt = 0;
+
+bool isDeviceProvisioningMode()
+{
+  return provisioningMode;
+}
+
+static void loadWifiCredentials()
+{
+  Preferences preferences;
+  if (preferences.begin(WIFI_PREFS_NAMESPACE, true)) {
+    wifiSsid = preferences.getString("ssid", DEFAULT_WIFI_SSID);
+    wifiPassword = preferences.getString("pwd", DEFAULT_WIFI_PASSWORD);
+    mcpBridgeIp = preferences.getString("bridge_ip", mcpDefaultBridgeIp());
+    preferences.end();
+  } else {
+    wifiSsid = DEFAULT_WIFI_SSID;
+    wifiPassword = DEFAULT_WIFI_PASSWORD;
+    mcpBridgeIp = mcpDefaultBridgeIp();
+  }
+  if (!isValidBridgeIp(mcpBridgeIp.c_str())) mcpBridgeIp = mcpDefaultBridgeIp();
+}
+
+static bool saveWifiCredential(const char* key, const String& value)
+{
+  Preferences preferences;
+  if (!preferences.begin(WIFI_PREFS_NAMESPACE, false)) return false;
+
+  // Skip flash writes only if this exact value has already been stored.
+  if (preferences.isKey(key) && preferences.getString(key) == value) {
+    preferences.end();
+    return true;
+  }
+
+  size_t written = preferences.putString(key, value);
+  // Core 2.0.14 returns zero for BOTH an empty string and a failed write.
+  bool saved = value.length() > 0
+      ? written == value.length()
+      : preferences.isKey(key) && preferences.getString(key, "!") == value;
+  preferences.end();
+  return saved;
+}
+
+static void printWifiCredential(const char* name, const String& value)
+{
+  Serial.printf("WIFI: %s=%s\n", name, value.c_str());
+}
+
+DeviceNetworkConfig getDeviceNetworkConfig()
+{
+  std::lock_guard<std::mutex> guard(deviceConfigMutex);
+  DeviceNetworkConfig config = {};
+  snprintf(config.ssid, sizeof(config.ssid), "%s", wifiSsid.c_str());
+  snprintf(config.pwd, sizeof(config.pwd), "%s", wifiPassword.c_str());
+  snprintf(config.mcpIp, sizeof(config.mcpIp), "%s", mcpBridgeIp.c_str());
+  return config;
+}
+
+bool isValidDeviceNetworkParameter(const char* name, const char* value)
+{
+  if (name == nullptr || value == nullptr) return false;
+  const size_t length = strlen(value);
+  const bool ssid = strcmp(name, "ssid") == 0;
+  const bool pwd = strcmp(name, "pwd") == 0;
+  const bool bridge = strcmp(name, "mcp_ip") == 0;
+  if ((!ssid && !pwd && !bridge) || (ssid && (length == 0 || length > 32))
+      || (pwd && length > 64) || (bridge && !isValidBridgeIp(value))) {
+    return false;
+  }
+  return true;
+}
+
+DeviceConfigResult setDeviceNetworkParameter(const char* name, const char* value)
+{
+  if (!isValidDeviceNetworkParameter(name, value)) return DeviceConfigResult::Invalid;
+  const bool ssid = strcmp(name, "ssid") == 0;
+  const bool pwd = strcmp(name, "pwd") == 0;
+  const bool bridge = strcmp(name, "mcp_ip") == 0;
+  std::lock_guard<std::mutex> guard(deviceConfigMutex);
+  const String next = value;
+  if (!saveWifiCredential(bridge ? "bridge_ip" : name, next)) return DeviceConfigResult::StorageFailure;
+  if (ssid) wifiSsid = next;
+  if (pwd) wifiPassword = next;
+  if (bridge) mcpBridgeIp = next;
+  return DeviceConfigResult::Saved;
+}
+
+void requestDeviceRestart()
+{
+  std::lock_guard<std::mutex> guard(deviceConfigMutex);
+  if (!restartRequested) {
+    restartRequestedAt = millis();
+    restartRequested = true;
+  }
+}
+
+static void processDeviceRestart()
+{
+  bool restart = false;
+  {
+    std::lock_guard<std::mutex> guard(deviceConfigMutex);
+    restart = restartRequested && millis() - restartRequestedAt >= 1000;
+  }
+  if (restart) ESP.restart();
+}
 
 void startCameraServer();
 void setupLedFlash(int pin);
+
+static void printSerialCommands()
+{
+  Serial.println("串口命令（115200 波特率，每行一条）：");
+  Serial.println("ssid=<Wi-Fi名称>  设置并保存 Wi-Fi 名称（1-32 字节）");
+  Serial.println("pwd=<Wi-Fi密码>  设置并保存密码（0-64 字节；pwd= 表示开放网络）");
+  Serial.println("mcp_ip=<桥接服务IPv4>  保存 MCP 桥接服务地址，重启后生效");
+  Serial.println("ssid? / pwd? / mcp_ip?  查询已保存配置（pwd? 会明文显示密码）");
+  Serial.println("v  单次视觉识别；s  查看识别状态；w  无线诊断；d  网络分段诊断");
+  Serial.println("run<N>  连续识别 1-50 次；ps<N>  设置 Wi-Fi 省电模式");
+  Serial.println("tx<N>  设置 Wi-Fi 发射功率；proto<N>  设置 Wi-Fi 协议；bw<N>  设置带宽");
+  Serial.println("wifi_config  手动开启 ESP32-CAM-7 临时配置热点；reboot  重启并应用设置");
+  Serial.println("help  再次显示本命令列表");
+}
+
+static void printStartupSerialCommands()
+{
+  if (startupCommandsPrinted) return;
+  startupCommandsPrinted = true;
+  printSerialCommands();
+}
+
+static void startHttpServerIfNeeded()
+{
+  if (!mcpStatusStarted) {
+    mcpStatusInit();
+    mcpStatusStarted = true;
+  }
+  if (!httpServerStarted) {
+    startCameraServer();
+    httpServerStarted = true;
+  }
+}
+
+static void startNetworkServicesIfReady()
+{
+  if (!cameraReady || WiFi.status() != WL_CONNECTED) return;
+  if (provisioningMode && !provisioningManual) {
+    WiFi.softAPdisconnect(true);
+    provisioningMode = false;
+    Serial.println("WiFi config hotspot stopped after station connection");
+  }
+  startHttpServerIfNeeded();
+  if (!networkServicesStarted) {
+    networkServicesStarted = true;
+    visionInit();
+  }
+  if (registrationStarted) return;
+  registrationStarted = true;
+  startMcpRegistration(String(getDeviceNetworkConfig().mcpIp));
+  Serial.printf("Camera Ready! Use 'http://%s' to connect\n", WiFi.localIP().toString().c_str());
+  Serial.printf("Vision Recognition Ready! Use 'http://%s/vision' to control\n", WiFi.localIP().toString().c_str());
+  DeviceNetworkConfig network = getDeviceNetworkConfig();
+  Serial.printf("ESP32-CAM网页服务地址: http://%s/vision\n", WiFi.localIP().toString().c_str());
+  Serial.printf("MCP上位机服务IP: %s:%u\n", network.mcpIp, (unsigned)mcpBridgePort());
+  printStartupSerialCommands();
+}
+
+static void startWifiConfigPortal(bool manual = false);
 
 void setup() {
   Serial.begin(115200);
   Serial.setDebugOutput(true);
   Serial.println();
+  loadWifiCredentials();
+  Serial.println("WiFi startup: waiting for network initialization...");
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -112,9 +295,12 @@ void setup() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
+    startWifiConfigPortal();
+    printStartupSerialCommands();
     return;
   }
 
+  cameraReady = true;
   sensor_t * s = esp_camera_sensor_get();
 
   // initial sensors are flipped vertically and colors are a bit saturated
@@ -176,7 +362,9 @@ void setup() {
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
-  WiFi.begin(ssid, password);
+  Serial.printf("WiFi config loaded: ssid=%s\n", wifiSsid.c_str());
+  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  WiFi.setAutoReconnect(true);
   // 注意：setSleep/setTxPower 必须在 STA 真正启动后调用才生效，
   // 放在 begin() 紧后面会因为 Wi-Fi 还没 start 而静默失败，
   // 那样射频仍跑在 modem sleep，表现为“信号很好但丢包 80%+、RTT 几百毫秒”。
@@ -192,10 +380,13 @@ void setup() {
     Serial.print(".");
   }
 
-  if (WiFi.status() != WL_CONNECTED) {
+  if (shouldStartWifiConfigPortal(WiFi.status() == WL_CONNECTED,
+                                  millis() - wifiStartMs, wifiTimeoutMs)) {
     Serial.println();
     Serial.printf("WiFi connection failed, status=%d\n", WiFi.status());
     Serial.println("Check SSID/password and make sure a 2.4 GHz network is available.");
+    startWifiConfigPortal();
+    printStartupSerialCommands();
     return;
   }
 
@@ -223,21 +414,7 @@ void setup() {
     Serial.printf("WiFi radio restored: proto=0x%X txpower=%.2fdBm\n", proto, tp * 0.25);
   }
 
-  // Initialize the MCP bridge status cache before the HTTP server starts,
-  // so reports arriving immediately are not dropped.
-  mcpStatusInit();
-
-  startCameraServer();
-
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
-
-  // Initialize vision recognition module
-  visionInit();
-  Serial.print("Vision Recognition Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/vision' to control");
+  startNetworkServicesIfReady();
 }
 
 // ---------------------------------------------------------------------------
@@ -377,11 +554,58 @@ static void runVisionBench(int n)
 
 static void runSerialCommand(String cmd)
 {
-  cmd.trim();
-  cmd.toLowerCase();
-  if (cmd.length() == 0) return;
+  // Normalize only the keyword. Never trim or lowercase credential values.
+  String command = cmd;
+  command.toLowerCase();
 
-  if (cmd == "v") {
+  if (command.startsWith("mcp_ip=")) {
+    String value = cmd.substring(7);
+    if (!isValidBridgeIp(value.c_str())) {
+      Serial.println("CMD: mcp_ip must be a unicast IPv4 address");
+    } else if (setDeviceNetworkParameter("mcp_ip", value.c_str()) == DeviceConfigResult::Saved) {
+      Serial.printf("CMD: bridge IP saved: %s, reboot to apply\n", value.c_str());
+    } else {
+      Serial.println("CMD: failed to save bridge IP");
+    }
+    return;
+  }
+
+  if (command.startsWith("ssid=")) {
+    String value = cmd.substring(5);
+    if (value.length() == 0 || value.length() > 32) {
+      Serial.println("CMD: ssid must be 1-32 bytes");
+    } else if (setDeviceNetworkParameter("ssid", value.c_str()) == DeviceConfigResult::Saved) {
+      Serial.printf("CMD: ssid saved (%u bytes), reboot to connect\n",
+                    (unsigned)value.length());
+    } else {
+      Serial.println("CMD: failed to save ssid");
+    }
+    return;
+  }
+  if (command.startsWith("pwd=")) {
+    String value = cmd.substring(4);
+    if (value.length() > 64) {
+      Serial.println("CMD: pwd must be 0-64 bytes (empty for an open network)");
+    } else if (setDeviceNetworkParameter("pwd", value.c_str()) == DeviceConfigResult::Saved) {
+      Serial.printf("CMD: pwd saved (%u bytes), reboot to connect\n",
+                    (unsigned)value.length());
+    } else {
+      Serial.println("CMD: failed to save pwd");
+    }
+    return;
+  }
+
+  cmd.trim();
+  command = cmd;
+  command.toLowerCase();
+  if (command.length() == 0) return;
+  if (command == "mcp_ip?") {
+    Serial.printf("MCP: bridge_ip=%s\n", getDeviceNetworkConfig().mcpIp);
+  } else if (command == "ssid?") {
+    printWifiCredential("ssid", String(getDeviceNetworkConfig().ssid));
+  } else if (command == "pwd?") {
+    printWifiCredential("pwd", String(getDeviceNetworkConfig().pwd));
+  } else if (command == "v") {
     bool success = false;
     unsigned long dur = 0;
     char msg[VISION_MESSAGE_MAX];
@@ -390,37 +614,39 @@ static void runSerialCommand(String cmd)
     bool finished = visionTriggerWait(120000, &success, &dur, msg, sizeof(msg));
     Serial.printf("CMD: finished=%d success=%d dev_ms=%lu wall_ms=%lu msg=%s\n",
                   finished ? 1 : 0, success ? 1 : 0, dur, millis() - t0, msg);
-  } else if (cmd == "s") {
+  } else if (command == "s") {
     printVisionState();
-  } else if (cmd == "w") {
+  } else if (command == "w") {
     printWifiDiag();
-  } else if (cmd == "d") {
+  } else if (command == "d") {
     runNetDiag();
-  } else if (cmd.startsWith("run")) {
-    int n = cmd.substring(3).toInt();
+  } else if (command.startsWith("run")) {
+    int n = command.substring(3).toInt();
     if (n < 1) n = 1;
     if (n > 50) n = 50;
     runVisionBench(n);
-  } else if (cmd.startsWith("ps")) {
-    int v = cmd.substring(2).toInt();
+  } else if (command.startsWith("ps")) {
+    int v = command.substring(2).toInt();
     esp_err_t e = esp_wifi_set_ps((wifi_ps_type_t)v);
     Serial.printf("CMD: ps=%d -> %s\n", v, esp_err_to_name(e));
-  } else if (cmd.startsWith("tx")) {
-    int v = cmd.substring(2).toInt();
+  } else if (command.startsWith("tx")) {
+    int v = command.substring(2).toInt();
     esp_err_t e = esp_wifi_set_max_tx_power((int8_t)v);
     Serial.printf("CMD: tx=%d -> %s\n", v, esp_err_to_name(e));
-  } else if (cmd.startsWith("proto")) {
-    int v = strtol(cmd.substring(5).c_str(), NULL, 0);
+  } else if (command.startsWith("proto")) {
+    int v = strtol(command.substring(5).c_str(), NULL, 0);
     esp_err_t e = esp_wifi_set_protocol(WIFI_IF_STA, (uint8_t)v);
     uint8_t cur = 0; esp_wifi_get_protocol(WIFI_IF_STA, &cur);
     Serial.printf("CMD: proto=0x%X -> %s (now 0x%X)\n", v, esp_err_to_name(e), cur);
-  } else if (cmd.startsWith("bw")) {
-    int v = cmd.substring(2).toInt();
+  } else if (command.startsWith("bw")) {
+    int v = command.substring(2).toInt();
     esp_err_t e = esp_wifi_set_bandwidth(WIFI_IF_STA, (wifi_bandwidth_t)v);
     Serial.printf("CMD: bw=%d -> %s\n", v, esp_err_to_name(e));
-  } else if (cmd == "help") {
-    Serial.println("CMD: v=单次识别 s=状态 w=无线诊断 d=网络分段诊断 runN=连续N次 psN=省电 txN=功率 protoN=协议 bwN=带宽 reboot");
-  } else if (cmd == "reboot") {
+  } else if (command == "wifi_config") {
+    startWifiConfigPortal(true);
+  } else if (command == "help") {
+    printSerialCommands();
+  } else if (command == "reboot") {
     Serial.println("CMD: rebooting");
     delay(100);
     ESP.restart();
@@ -431,18 +657,49 @@ static void runSerialCommand(String cmd)
 
 void loop() {
   static String cmdBuf;
+  static bool discardLine = false;
+  const size_t maxCommandBytes = 160;
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      runSerialCommand(cmdBuf);
+    if (c == '\r' || c == '\n') {
+      if (!discardLine) runSerialCommand(cmdBuf);
       cmdBuf = "";
-    } else if (cmdBuf.length() < 40) {
-      cmdBuf += c;
-    } else {
-      cmdBuf = "";
+      discardLine = false;
+    } else if (!discardLine) {
+      if (c != '\0' && cmdBuf.length() < maxCommandBytes) {
+        cmdBuf += c;
+      } else {
+        // Discard until the line ends: its tail must never become a command.
+        cmdBuf = "";
+        discardLine = true;
+        Serial.println("CMD: input too long or contains NUL; line discarded");
+      }
     }
   }
+  startNetworkServicesIfReady();
+  processDeviceRestart();
   delay(20);
 }
 
+static void startWifiConfigPortal(bool manual)
+{
+  if (provisioningMode) return;
+  if (!WiFi.mode(WIFI_AP_STA)) {
+    Serial.println("WiFi config hotspot mode failed to start");
+    return;
+  }
+  IPAddress apIp(192, 168, 4, 1);
+  IPAddress apGateway(192, 168, 4, 1);
+  IPAddress apSubnet(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(apIp, apGateway, apSubnet)
+      || !WiFi.softAP(WIFI_CONFIG_AP_SSID, NULL, 1, 0, 4)) {
+    Serial.println("WiFi config hotspot failed to start");
+    return;
+  }
+  provisioningMode = true;
+  provisioningManual = manual;
+  startHttpServerIfNeeded();
+  Serial.printf("WiFi config hotspot: %s (open)\n", WIFI_CONFIG_AP_SSID);
+  Serial.printf("WiFi config page: http://%s/config\n", WiFi.softAPIP().toString().c_str());
+  printStartupSerialCommands();
+}

@@ -30,7 +30,8 @@ ESP32-CAM
 | `camera_mcp.py` | 提供 `look_at_camera` 和 `watch_camera` 两个 MCP 工具 |
 | `medicine_tools.py` | 药品识别、建档、服药记录、提醒、资料查询共 7 个 MCP 工具 |
 | `medicine_store.py` | 药品功能的文件存储、幂等与配置加载 |
-| `medicine_config.example.json` / `medicine_config.json` | 药品功能配置模板 / 本机配置 |
+| `medicine_config.json` | 药品功能配置（已入库，克隆后即可用；不含密钥） |
+| `medicine_config.example.json` | 出厂默认配置，用于覆盖恢复 |
 | `medicine_library.json` | 本地药品库（用法、剂量、注意事项） |
 | `MEDICINE.md` / `MIGRATION.md` | 药品工具说明 / 迁移到其他电脑的步骤 |
 | `esp32_client.py` | ESP32 HTTP 客户端、状态轮询、请求超时和连接重试 |

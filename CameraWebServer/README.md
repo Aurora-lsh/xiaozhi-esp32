@@ -213,11 +213,11 @@ notepad .env
 
 电脑端在原有 `look_at_camera` / `watch_camera` 之外新增 7 个 MCP 工具，把“识别—建档—记录—查询—提醒—讲解”做成纯电脑端的本地能力。**不需要修改固件，也不需要重新烧录。**
 
-启用方式：把示例配置复制为正式配置即可，代码会自动加载。
+启用方式：仓库已包含默认配置 `mcp_server/medicine_config.json`，克隆后即可使用，无需额外操作。需要调整阈值时直接编辑该文件，改完自动生效，不必重启桥接。若要恢复到出厂默认，用示例配置覆盖即可：
 
 ```powershell
 cd .\mcp_server
-Copy-Item medicine_config.example.json medicine_config.json
+Copy-Item medicine_config.example.json medicine_config.json -Force
 ```
 
 工具一览：
@@ -276,6 +276,7 @@ reboot
 - `VISION_API_KEY` 会被编译进固件，不能把包含真实密钥的源码公开或提交到公共仓库；密钥泄露后应立即撤销并重新生成。
 - `mcp_server/.env` 包含小智 MCP endpoint 和 token，不能公开分享。
 - `mcp_server/runtime/` 下的药品档案与服药记录属于个人健康数据，已被 `.gitignore` 忽略，不要提交。
+- `mcp_server/medicine_config.json` 与 `medicine_library.json` 只含路径、阈值和药品说明，不含密钥，已纳入版本管理；不要往这两个文件里写令牌或个人健康信息。
 - 当前 ESP32 HTTP 接口没有身份认证，只应在可信局域网使用，不要直接映射到公网。
 - 如需远程访问，应使用 VPN 或受控反向隧道，并在网关层增加认证。
 

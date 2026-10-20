@@ -52,11 +52,13 @@
 
 ## 三、配置文件
 
-首次使用把示例复制成正式配置：
+仓库已包含默认配置 `medicine_config.json`，克隆后无需额外操作即可使用。需要改阈值时直接编辑它，按 mtime 自动重载，**不必重启桥接**。若要恢复出厂默认：
 
 ```powershell
-Copy-Item medicine_config.example.json medicine_config.json
+Copy-Item medicine_config.example.json medicine_config.json -Force
 ```
+
+`medicine_config.json` 只包含路径、阈值和提示词，不含任何密钥，因此和 `medicine_library.json` 一起纳入版本管理。真正含密钥的 `.env` 与含个人健康数据的 `runtime/` 仍被 `.gitignore` 忽略。
 
 | 字段 | 默认 | 说明 |
 |---|---|---|

@@ -28,15 +28,23 @@ ESP32-CAM
 | --- | --- |
 | `xiaozhi_mcp_bridge.py` | 维护到小智 endpoint 的 WebSocket，并转发本地 MCP stdio |
 | `camera_mcp.py` | 提供 `look_at_camera` 和 `watch_camera` 两个 MCP 工具 |
+| `medicine_tools.py` | 药品识别、建档、服药记录、提醒、资料查询共 7 个 MCP 工具 |
+| `medicine_store.py` | 药品功能的文件存储、幂等与配置加载 |
+| `medicine_config.example.json` / `medicine_config.json` | 药品功能配置模板 / 本机配置 |
+| `medicine_library.json` | 本地药品库（用法、剂量、注意事项） |
+| `MEDICINE.md` / `MIGRATION.md` | 药品工具说明 / 迁移到其他电脑的步骤 |
 | `esp32_client.py` | ESP32 HTTP 客户端、状态轮询、请求超时和连接重试 |
 | `reporting.py` | 把桥接状态和日志回传到 ESP32 网页，失败不影响 MCP 调用 |
 | `camera_registration.py` | 校验 key、接收摄像头 IP，原子保存并供父子进程共享 |
 | `runtime/camera_address.json` | 最近认证通过的摄像头地址，服务重启后继续使用 |
+| `runtime/medicine/` | 药品档案与服药日志（本地记录，迁移时按需带走） |
 | `start_mcp.ps1` | 创建虚拟环境、安装依赖并启动桥接 |
 | `.env.example` | 配置模板 |
 | `.env` | 本机真实配置，不要公开或提交 |
 | `mcp_config.json` | 直接以本地 stdio 方式启动 `camera_mcp.py` 的示例配置 |
 | `tests/` | 客户端、工具和配置回归测试 |
+
+药品功能的完整说明见 [MEDICINE.md](MEDICINE.md)，换电脑运行见 [MIGRATION.md](MIGRATION.md)。
 
 ## 环境要求
 

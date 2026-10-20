@@ -44,6 +44,7 @@ ESP32 联网后主动向电脑的 `POST /camera/register` 上报自身 IP，电�
 | `mcp_status.cpp` / `mcp_status.h` | MCP 状态、日志和抓拍事件缓存 |
 | `device_config.h` | 网页和串口共享网络配置、校验、存储与重启接口 |
 | `mcp_server/` | 电脑端 MCP 服务和小智 WebSocket 桥接 |
+| `mcp_server/medicine_*.py` | 药品识别、建档、服药记录、提醒与资料查询工具 |
 | `build_flash.ps1` | 编译、烧录和可选串口监视 |
 | `mcp_registration.cpp` / `mcp_registration.h` | 带 key 的 IP 上报后台任务 |
 | `mcp_registration_config.h` | 本机私有默认桥接 IP、端口和固定 key |
@@ -205,6 +206,50 @@ notepad .env
 
 启动成功后，日志中应看到 `Connected to the Xiaozhi MCP endpoint`。电脑桥接进程必须保持运行；停止服务时在该窗口按 `Ctrl+C`。
 
+## 药品与用药功能
+
+电脑端在原有 `look_at_camera` / `watch_camera` 之外新增 7 个 MCP 工具，把“识别—建档—记录—查询—提醒—讲解”做成纯电脑端的本地能力。**不需要修改固件，也不需要重新烧录。**
+
+启用方式：把示例配置复制为正式配置即可，代码会自动加载。
+
+```powershell
+cd .\mcp_server
+Copy-Item medicine_config.example.json medicine_config.json
+```
+
+工具一览：
+
+| 工具 | 作用 |
+| --- | --- |
+| `identify_medicine` | 拍药盒，返回药名与规格，并与本地药品库匹配 |
+| `remember_medicine` | 建/更新药品档案，可同时记住用户口述的用法、剂量、频次 |
+| `log_medicine_taken` | 写一条服药记录，时间窗内重复提交自动去重 |
+| `query_medicine_records` | 读回服药记录，供语音播报 |
+| `set_medicine_reminder` | 保存提醒计划 |
+| `check_medicine_reminders` | 查询到点、已过时和即将到点的提醒 |
+| `get_medicine_info` | 取用法、剂量、注意事项（药品库优先，其次用户口述） |
+
+三条必须遵守的语义边界：
+
+1. **识别不等于服药。** `identify_medicine` 只读摄像头，看到药盒不会产生服药记录。
+2. **只有 `log_medicine_taken` 写服药记录。** 用户明确说“吃过了”才调用。
+3. **提醒不会主动说话。** MCP 工具是被动调用的，到点提醒要靠对话中查询 `check_medicine_reminders`。
+
+药品库是人工维护的白名单（`mcp_server/medicine_library.json`）。库外药品若想让机器人答出用量，必须在建档时把用户口述的方案一起记下：
+
+```text
+用户：记住感冒灵，一天吃三次
+→ remember_medicine(name="感冒灵颗粒", frequency="一日3次", dose="1袋")
+
+用户：这个一天吃几次？
+→ get_medicine_info("感冒灵颗粒")
+   { "found": true, "source": "用户口述", "medicine": { "frequency": "一日3次", ... } }
+```
+
+查询优先级固定为**本地药品库 → 用户口述 → 明确说没有**。库内资料永远优先，不会被用户口述覆盖；来源是“用户口述”时必须说明这是用户告诉的，不能讲成说明书内容。
+
+数据存放在 `mcp_server/runtime/medicine/`（已被 `.gitignore` 忽略），换电脑的搬运步骤见 [mcp_server/MIGRATION.md](./mcp_server/MIGRATION.md)。完整说明见 [mcp_server/MEDICINE.md](./mcp_server/MEDICINE.md)。
+
 ## 动态地址注册配置
 
 本机已配对 `mcp_server/.env` 中的 `CAMERA_REGISTRATION_KEY` 和 `mcp_registration_config.h` 中的 `MCP_REGISTRATION_KEY`。桥接默认监听 `0.0.0.0:8765`，当前固件默认桥接 IP 为 `192.168.240.247`；该默认值只在设备未保存地址时使用。
@@ -227,6 +272,7 @@ reboot
 
 - `VISION_API_KEY` 会被编译进固件，不能把包含真实密钥的源码公开或提交到公共仓库；密钥泄露后应立即撤销并重新生成。
 - `mcp_server/.env` 包含小智 MCP endpoint 和 token，不能公开分享。
+- `mcp_server/runtime/` 下的药品档案与服药记录属于个人健康数据，已被 `.gitignore` 忽略，不要提交。
 - 当前 ESP32 HTTP 接口没有身份认证，只应在可信局域网使用，不要直接映射到公网。
 - 如需远程访问，应使用 VPN 或受控反向隧道，并在网关层增加认证。
 
@@ -269,6 +315,14 @@ $env:PYTHONPATH = (Get-Location).Path
 & .\mcp_server\.venv\Scripts\python.exe -B tests/run_device_http_tests.py
 node tests/web_network_config_tests.cjs
 ```
+
+只跑药品相关用例：
+
+```powershell
+& .\mcp_server\.venv\Scripts\python.exe -B -m unittest mcp_server.tests.test_medicine_store mcp_server.tests.test_medicine_tools -v
+```
+
+> 若系统 `TMP` 指向不可写目录，先设置 `$env:TMP` / `$env:TEMP` 到可写路径，否则 `tempfile.TemporaryDirectory` 会在清理阶段报 `PermissionError`，这与代码逻辑无关。药品测试自身使用仓库内 `.test-tmp/`，可直接删除。
 
 固件只编译验证：
 

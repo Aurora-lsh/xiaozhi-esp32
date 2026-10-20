@@ -15,9 +15,11 @@ from dotenv import load_dotenv
 try:
     from .esp32_client import Esp32VisionClient
     from .camera_registration import resolve_camera_url, start_registration_from_env
+    from .medicine_tools import medicine_tools
 except ImportError:
     from esp32_client import Esp32VisionClient
     from camera_registration import resolve_camera_url, start_registration_from_env
+    from medicine_tools import medicine_tools
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env", encoding="utf-8-sig")
@@ -148,6 +150,8 @@ def create_server():
     # Explicit registration keeps the underlying functions directly testable.
     server.tool()(look_at_camera)
     server.tool()(watch_camera)
+    for tool in medicine_tools():
+        server.tool()(tool)
     return server
 
 

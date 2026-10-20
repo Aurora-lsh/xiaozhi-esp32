@@ -1,0 +1,19 @@
+{
+  "enabled": true,
+
+  "data_dir": "runtime/medicine",
+  "library_file": "medicine_library.json",
+
+  "timezone_offset_minutes": 480,
+
+  "identify_prompt": "只回答画面中药盒的药品名称和规格，最多15个字，不要解释。",
+  "identify_max_chars": 15,
+
+  "duplicate_window_seconds": 90,
+  "default_dose": "1",
+
+  "query_limit": 20,
+  "query_limit_max": 100,
+
+  "reminder_grace_minutes": 120
+}

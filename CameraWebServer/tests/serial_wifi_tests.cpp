@@ -121,6 +121,8 @@ struct WiFiFake {
   bool passwordWasNull = false;
   bool apDisconnected = false;
   bool apStopSucceeds = true;
+  // apKeepMode=true 表示底层关闭失败、AP 模式保持不变（用于模拟真实失败）。
+  bool apKeepMode = false;
   unsigned connectedStations = 0;
   unsigned apStopCalls = 0;
   template <typename Callback>
@@ -141,13 +143,20 @@ struct WiFiFake {
   bool softAP(const char* ssid, const char* password, int, int, int) {
     ++apStartCalls; apSsid = ssid; passwordWasNull = password == nullptr; return apStarts;
   }
-  bool softAPdisconnect(bool) {
+  bool softAPdisconnect(bool wifioff) {
     ++apStopCalls;
     if (!apStopSucceeds) return false;
+    if (apKeepMode) return false;          // 底层关闭失败：AP 模式保持不变
     apDisconnected = true;
     connectedStations = 0;
-    return true;
+    if (wifioff) currentMode &= ~WIFI_AP;
+    // 复刻 Arduino core 2.0.14 的真实语义：热点确实关掉了，但返回值是 false。
+    // WiFiAPClass::softAPdisconnect(true) 内部先 esp_wifi_set_config() 成功，
+    // 再 WiFi.enableAP(false)，而 enableAP(false) 走 WiFiGenericClass::mode()，
+    // 该函数在关闭 AP 的正常路径上返回 false。调用方不能依赖返回值判断结果。
+    return false;
   }
+  int getMode() const { return currentMode; }
   unsigned softAPgetStationNum() const { return connectedStations; }
 } WiFi;
 static unsigned serverStarts = 0;
@@ -367,10 +376,12 @@ int main() {
       loop();
       require(!provisioningMode && WiFi.apStartCalls == 1, "repeated command extended idle timeout");
     }},
-    {"hotspot close failure retries without losing AP state", [] {
+    {"hotspot close retries while AP mode is still active", [] {
       startWifiConfigPortal();
       currentMillis = 20000;
+      // apStopSucceeds=false 表示底层关闭失败，AP 模式保持不变。
       WiFi.apStopSucceeds = false;
+      WiFi.apKeepMode = true;
       loop();
       require(provisioningMode && WiFi.apStopCalls == 1, "close failure marked AP inactive");
       currentMillis = 20999;
@@ -378,8 +389,34 @@ int main() {
       require(WiFi.apStopCalls == 1, "close retry was not throttled");
       currentMillis = 21000;
       WiFi.apStopSucceeds = true;
+      WiFi.apKeepMode = false;
       loop();
       require(!provisioningMode && WiFi.apStopCalls == 2, "close retry failed");
+    }},
+    {"softAPdisconnect returning false still closes hotspot", [] {
+      // 回归：Arduino core 2.0.14 中 softAPdisconnect(true) 成功关闭 AP 后
+      // 仍返回 false。旧代码据此判失败，无限重试且不清 provisioningMode，
+      // 导致设备永远停在配网模式、/vision 一直显示配置页。
+      startWifiConfigPortal();
+      currentMillis = 20000;
+      WiFi.apStopSucceeds = true;      // 底层真实关闭成功
+      WiFi.apKeepMode = false;
+      loop();
+      require(WiFi.apStopCalls == 1, "hotspot close was not attempted");
+      require(!provisioningMode, "hotspot stayed in provisioning mode despite AP being disabled");
+      require((WiFi.getMode() & WIFI_AP) == 0, "AP mode bit should be cleared after successful close");
+      currentMillis = 40000;
+      loop();
+      require(WiFi.apStopCalls == 1, "hotspot kept retrying after it was actually closed");
+    }},
+    {"vision page falls back to capture UI once station is online", [] {
+      // 回归：设备已连上外部 Wi-Fi 时，/vision 不应再被强制显示配置页。
+      startWifiConfigPortal();
+      require(isDeviceProvisioningMode() && WiFi.status() != WL_CONNECTED,
+              "expected provisioning mode with no station link");
+      WiFi.online = true;
+      require(!(isDeviceProvisioningMode() && WiFi.status() != WL_CONNECTED),
+              "online device must not be forced to the provisioning page");
     }},
     {"AP timeout handles millis wraparound", [] {
       currentMillis = UINT32_MAX - 10000;

@@ -13,6 +13,7 @@
 // limitations under the License.
 #include "esp_http_server.h"
 #include <string.h>
+#include <WiFi.h>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include "esp_timer.h"
@@ -1293,7 +1294,12 @@ function rebootDevice(){show('正在请求重启…',false);fetch('/device/reboo
 
 static esp_err_t vision_page_handler(httpd_req_t *req)
 {
-    if (isDeviceProvisioningMode()) return provisioning_page_handler(req);
+    // 只有「热点还开着 且 设备没连上外部 Wi-Fi」时才强制显示配置页。
+    // 设备一旦连上外部 Wi-Fi，/vision 就应该正常显示拍照界面；
+    // 否则配网阶段遗留的状态会让已联网设备一直卡在配置页。
+    if (isDeviceProvisioningMode() && WiFi.status() != WL_CONNECTED) {
+        return provisioning_page_handler(req);
+    }
     static const char kVisionHtml[] = R"HTML(<!DOCTYPE html>
 <html lang="zh-CN">
 <head>

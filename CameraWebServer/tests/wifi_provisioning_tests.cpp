@@ -29,5 +29,14 @@ int main()
   require(!shouldCloseWifiConfigPortal(1, 90000, 70001, 20000), "client arriving at timeout was ignored");
   require(!shouldCloseWifiConfigPortal(0, 9998, UINT32_MAX - 10000, 20000), "timer wraparound closed hotspot early");
   require(shouldCloseWifiConfigPortal(0, 9999, UINT32_MAX - 10000, 20000), "timer wraparound prevented timeout");
+
+  // 回归：softAPdisconnect(true) 在 Arduino core 2.0.14 的「关闭 AP」正常路径上
+  // 返回 false，旧的判据会误判为失败并反复重试，使设备永远停在配网模式。
+  // 现在必须按 WiFi.getMode() 的 AP 位判断，而不是看返回值。
+  // WIFI_MODE_NULL=0, WIFI_MODE_STA=1, WIFI_MODE_AP=2, WIFI_MODE_APSTA=3
+  require(isAccessPointDisabled(0), "null mode must count as disabled");
+  require(isAccessPointDisabled(1), "STA-only mode must count as AP disabled");
+  require(!isAccessPointDisabled(2), "AP-only mode must not count as disabled");
+  require(!isAccessPointDisabled(3), "AP+STA mode must not count as disabled");
   std::cout << checksPassed << "/" << checksPassed << " Wi-Fi provisioning timeout checks passed\n";
 }

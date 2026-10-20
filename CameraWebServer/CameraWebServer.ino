@@ -736,13 +736,26 @@ static void updateWifiConfigPortal()
                                    WIFI_CONFIG_AP_IDLE_TIMEOUT_MS)) return;
   if (WiFi.softAPgetStationNum() > 0
       || provisioningLastActivityMs.load(std::memory_order_relaxed) != lastActivity) return;
-  if (WiFi.softAPdisconnect(true)) {
+
+  // 注意：不要用 softAPdisconnect(true) 的返回值判断成功与否。
+  // Arduino core 2.0.14 的 WiFiAPClass::softAPdisconnect(true) 内部先调用
+  // esp_wifi_set_config()，成功后才调用 WiFi.enableAP(false)；
+  // 而 enableAP(false) 走 WiFiGenericClass::mode()，该函数在正常关闭 AP 的
+  // 路径上返回 false（并非错误）。于是热点其实已经关掉，函数却返回 false，
+  // 旧代码据此反复打印 "shutdown failed; retrying" 并且永远不清 provisioningMode，
+  // 导致设备一直停在配网模式：/vision 一直显示配置页，配置页也一直在。
+  //
+  // 因此这里改为：调用后以「AP 是否真的关闭」作为判据，而不是看返回值。
+  WiFi.softAPdisconnect(true);
+  const uint8_t modeAfter = (uint8_t)WiFi.getMode();
+  if (isAccessPointDisabled(modeAfter)) {
     provisioningMode.store(false, std::memory_order_relaxed);
     Serial.println("WiFi config hotspot stopped after 20 seconds with no connected clients");
   } else {
     provisioningLastActivityMs.store(
         millis() - WIFI_CONFIG_AP_IDLE_TIMEOUT_MS + 1000,
         std::memory_order_relaxed);
-    Serial.println("WiFi config hotspot shutdown failed; retrying");
+    Serial.printf("WiFi config hotspot shutdown failed (mode=%u); retrying\n",
+                  (unsigned)modeAfter);
   }
 }

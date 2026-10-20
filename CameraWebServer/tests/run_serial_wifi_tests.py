@@ -9,11 +9,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sketch = (ROOT / "CameraWebServer.ino").read_text(encoding="utf-8")
 setup = sketch[sketch.index("void setup()"):sketch.index("static void runSerialCommand")]
 assert setup.index("loadWifiCredentials();") < setup.index("esp_camera_init("), "Load credentials even when camera initialization fails"
-assert "WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());" in setup, "Boot must use saved credentials"
+assert 'const DeviceNetworkConfig connectConfig = getDeviceNetworkConfig();' in setup and 'WiFi.begin(connectConfig.ssid, connectConfig.pwd);' in setup, "Boot must use a synchronized snapshot of credentials editable through the hotspot"
 assert "WiFi serial: ssid=... pwd=..." not in setup, "Serial commands must not be advertised before initialization"
 assert 'WiFi.softAP(WIFI_CONFIG_AP_SSID, NULL, 1, 0, 4)' in sketch, "Open provisioning AP is not configured"
 assert 'WiFi config page: http://' in sketch and '/config' in sketch, "Provisioning page address is not printed"
-assert 'shouldStartWifiConfigPortal(WiFi.status() == WL_CONNECTED' in setup, "Wi-Fi timeout does not control provisioning AP startup"
+assert setup.index('startWifiConfigPortal();') < setup.index('esp_camera_init(') < setup.index('WiFi.begin('), "Open hotspot must be available before camera initialization and STA connect"
+assert setup.count('startWifiConfigPortal();') == 1, "STA connection failure must not reopen an expired hotspot"
+assert 'updateWifiConfigPortal();' in setup, "Hotspot timeout must run during boot Wi-Fi wait"
+assert 'startWifiConfigMonitor(updateWifiConfigPortal)' in setup, "Hotspot timeout must not depend on serial recognition completing"
 assert 'WiFi.mode(WIFI_AP_STA)' in sketch, "STA reconnect is not preserved during provisioning"
 assert 'command == "wifi_config"' in sketch, "Manual Wi-Fi configuration entry is missing"
 credentials = sketch[sketch.index("static const char* DEFAULT_WIFI_SSID"):sketch.index("void startCameraServer();")]

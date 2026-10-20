@@ -9,6 +9,7 @@
 #include "mcp_ip_validation.h"
 #include "device_config.h"
 #include "wifi_provisioning.h"
+#include <atomic>
 #include <mutex>
 
 //
@@ -56,15 +57,17 @@ static bool mcpStatusStarted = false;
 static bool networkServicesStarted = false;
 static bool registrationStarted = false;
 static bool startupCommandsPrinted = false;
-static bool provisioningMode = false;
-static bool provisioningManual = false;
+static std::atomic<bool> provisioningMode(false);
+static std::atomic<uint32_t> provisioningLastActivityMs(0);
+static bool provisioningMonitorStarted = false;
+static std::mutex provisioningLifecycleMutex;
 static std::mutex deviceConfigMutex;
 static bool restartRequested = false;
 static unsigned long restartRequestedAt = 0;
 
 bool isDeviceProvisioningMode()
 {
-  return provisioningMode;
+  return provisioningMode.load(std::memory_order_relaxed);
 }
 
 static void loadWifiCredentials()
@@ -205,11 +208,6 @@ static void startHttpServerIfNeeded()
 static void startNetworkServicesIfReady()
 {
   if (!cameraReady || WiFi.status() != WL_CONNECTED) return;
-  if (provisioningMode && !provisioningManual) {
-    WiFi.softAPdisconnect(true);
-    provisioningMode = false;
-    Serial.println("WiFi config hotspot stopped after station connection");
-  }
   startHttpServerIfNeeded();
   if (!networkServicesStarted) {
     networkServicesStarted = true;
@@ -226,7 +224,9 @@ static void startNetworkServicesIfReady()
   printStartupSerialCommands();
 }
 
-static void startWifiConfigPortal(bool manual = false);
+static void startWifiConfigPortal();
+static void onWifiEvent(WiFiEvent_t event);
+static void updateWifiConfigPortal();
 
 void setup() {
   Serial.begin(115200);
@@ -234,6 +234,13 @@ void setup() {
   Serial.println();
   loadWifiCredentials();
   Serial.println("WiFi startup: waiting for network initialization...");
+  WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+  WiFi.onEvent(onWifiEvent, ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+  startWifiConfigPortal();
+  provisioningMonitorStarted = startWifiConfigMonitor(updateWifiConfigPortal);
+  if (!provisioningMonitorStarted) {
+    Serial.println("WiFi config monitor could not start; using main-loop timeout checks");
+  }
 
   camera_config_t config;
   config.ledc_channel = LEDC_CHANNEL_0;
@@ -295,7 +302,6 @@ void setup() {
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Camera init failed with error 0x%x", err);
-    startWifiConfigPortal();
     printStartupSerialCommands();
     return;
   }
@@ -362,8 +368,9 @@ void setup() {
   setupLedFlash(LED_GPIO_NUM);
 #endif
 
-  Serial.printf("WiFi config loaded: ssid=%s\n", wifiSsid.c_str());
-  WiFi.begin(wifiSsid.c_str(), wifiPassword.c_str());
+  const DeviceNetworkConfig connectConfig = getDeviceNetworkConfig();
+  Serial.printf("WiFi config loaded: ssid=%s\n", connectConfig.ssid);
+  WiFi.begin(connectConfig.ssid, connectConfig.pwd);
   WiFi.setAutoReconnect(true);
   // 注意：setSleep/setTxPower 必须在 STA 真正启动后调用才生效，
   // 放在 begin() 紧后面会因为 Wi-Fi 还没 start 而静默失败，
@@ -377,15 +384,15 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED &&
          millis() - wifiStartMs < wifiTimeoutMs) {
     delay(500);
+    if (!provisioningMonitorStarted) updateWifiConfigPortal();
+    processDeviceRestart();
     Serial.print(".");
   }
 
-  if (shouldStartWifiConfigPortal(WiFi.status() == WL_CONNECTED,
-                                  millis() - wifiStartMs, wifiTimeoutMs)) {
+  if (WiFi.status() != WL_CONNECTED) {
     Serial.println();
     Serial.printf("WiFi connection failed, status=%d\n", WiFi.status());
-    Serial.println("Check SSID/password and make sure a 2.4 GHz network is available.");
-    startWifiConfigPortal();
+    Serial.println("WiFi disconnected; saved settings and serial console remain available.");
     printStartupSerialCommands();
     return;
   }
@@ -643,7 +650,7 @@ static void runSerialCommand(String cmd)
     esp_err_t e = esp_wifi_set_bandwidth(WIFI_IF_STA, (wifi_bandwidth_t)v);
     Serial.printf("CMD: bw=%d -> %s\n", v, esp_err_to_name(e));
   } else if (command == "wifi_config") {
-    startWifiConfigPortal(true);
+    startWifiConfigPortal();
   } else if (command == "help") {
     printSerialCommands();
   } else if (command == "reboot") {
@@ -677,12 +684,14 @@ void loop() {
     }
   }
   startNetworkServicesIfReady();
+  if (!provisioningMonitorStarted) updateWifiConfigPortal();
   processDeviceRestart();
   delay(20);
 }
 
-static void startWifiConfigPortal(bool manual)
+static void startWifiConfigPortal()
 {
+  std::lock_guard<std::mutex> guard(provisioningLifecycleMutex);
   if (provisioningMode) return;
   if (!WiFi.mode(WIFI_AP_STA)) {
     Serial.println("WiFi config hotspot mode failed to start");
@@ -696,10 +705,44 @@ static void startWifiConfigPortal(bool manual)
     Serial.println("WiFi config hotspot failed to start");
     return;
   }
+  provisioningLastActivityMs.store(millis(), std::memory_order_relaxed);
   provisioningMode = true;
-  provisioningManual = manual;
   startHttpServerIfNeeded();
   Serial.printf("WiFi config hotspot: %s (open)\n", WIFI_CONFIG_AP_SSID);
   Serial.printf("WiFi config page: http://%s/config\n", WiFi.softAPIP().toString().c_str());
-  printStartupSerialCommands();
+}
+
+static void onWifiEvent(WiFiEvent_t event)
+{
+  if (!provisioningMode) return;
+  if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+    provisioningLastActivityMs.store(millis(), std::memory_order_relaxed);
+  } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+    provisioningLastActivityMs.store(millis(), std::memory_order_relaxed);
+  }
+}
+
+static void updateWifiConfigPortal()
+{
+  std::lock_guard<std::mutex> guard(provisioningLifecycleMutex);
+  if (!provisioningMode.load(std::memory_order_relaxed)) return;
+  const uint32_t lastActivity = provisioningLastActivityMs.load(std::memory_order_relaxed);
+  const uint8_t connectedStations = WiFi.softAPgetStationNum();
+  if (connectedStations > 0) {
+    provisioningLastActivityMs.store(millis(), std::memory_order_relaxed);
+    return;
+  }
+  if (!shouldCloseWifiConfigPortal(connectedStations, millis(), lastActivity,
+                                   WIFI_CONFIG_AP_IDLE_TIMEOUT_MS)) return;
+  if (WiFi.softAPgetStationNum() > 0
+      || provisioningLastActivityMs.load(std::memory_order_relaxed) != lastActivity) return;
+  if (WiFi.softAPdisconnect(true)) {
+    provisioningMode.store(false, std::memory_order_relaxed);
+    Serial.println("WiFi config hotspot stopped after 20 seconds with no connected clients");
+  } else {
+    provisioningLastActivityMs.store(
+        millis() - WIFI_CONFIG_AP_IDLE_TIMEOUT_MS + 1000,
+        std::memory_order_relaxed);
+    Serial.println("WiFi config hotspot shutdown failed; retrying");
+  }
 }

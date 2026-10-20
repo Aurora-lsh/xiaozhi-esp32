@@ -60,6 +60,21 @@
 #define VISION_FRAMESIZE_DEFAULT 5    // FRAMESIZE_QVGA 320x240
 #define VISION_QUALITY_DEFAULT 12
 
+// 上传识别前对抓拍图做旋转校正。
+// 摄像头模块按当前装配方向装在外壳里，原始画面与正常观看方向相差 90 度，
+// 不校正会让大模型看到横躺的药盒，药名识别率明显下降。
+// 取值：0=不旋转，1=左旋90度（逆时针），2=右旋90度（顺时针），3=旋转180度。
+// 仅影响送模型的图片；网页预览和机械臂等其它用途不受影响。
+#define VISION_ROTATE_QUAD 1
+
+// 旋转后重新编码 JPEG 使用的画质（0-63，数值越小越清晰、体积越大）。
+// 与抓拍画质分开，避免二次编码把图片放大到超过 VISION_MAX_IMAGE_BYTES。
+#define VISION_ROTATE_JPEG_QUALITY 15
+
+// 允许旋转的最大像素数。QVGA(320x240)=76800，VGA(640x480)=307200。
+// 超过该值直接跳过旋转按原图上传，避免在受限内存下分配过大的 RGB888 缓冲。
+#define VISION_ROTATE_MAX_PIXELS 307200UL
+
 // 网页端等待摄像头的最长时间（毫秒）。
 // 识别上传期间相机被占用，超时后直接返回而不是卡住网页线程。
 #define VISION_PREVIEW_LOCK_WAIT_MS 2500U

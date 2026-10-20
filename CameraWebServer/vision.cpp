@@ -278,6 +278,139 @@ static bool storeImage(const uint8_t *buf, size_t len)
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// 抓拍图旋转校正
+//
+// 摄像头模块按当前装配方向固定在外壳内，原始画面相对正常观看方向偏 90 度。
+// 直接把原始 JPEG 送给大模型，药盒是横躺的，药名识别率明显下降。
+// 这里在识别前做一次像素级旋转，只影响送模型的图片；网页预览仍在
+// /vision/image 里保存原始帧，避免破坏既有的取图逻辑。
+//
+// 实现方式：JPEG 解码为 RGB888 -> 按象限重排像素 -> 重新编码为 JPEG。
+// 320x240 的一帧约占用 230KB，优先用 PSRAM，失败时回退内部 RAM。
+// ---------------------------------------------------------------------------
+
+// 把 src 的 RGB888 像素按 rotateQuad 旋转到 dst。
+// 1=左旋90度（逆时针），2=右旋90度（顺时针），3=180度。
+static bool rotateRgb888(const uint8_t *src, size_t srcW, size_t srcH,
+                         uint8_t *dst, size_t *outW, size_t *outH, uint8_t rotateQuad)
+{
+    if (!src || !dst || srcW == 0 || srcH == 0) return false;
+
+    size_t dstW = srcW;
+    size_t dstH = srcH;
+    bool swap = (rotateQuad == 1 || rotateQuad == 2);
+    if (swap) {
+        dstW = srcH;
+        dstH = srcW;
+    }
+
+    for (size_t y = 0; y < dstH; y++) {
+        for (size_t x = 0; x < dstW; x++) {
+            size_t sx, sy;
+            switch (rotateQuad) {
+                case 1:  // 左旋 90 度（逆时针）：目标(x,y) 来自源(sx = srcW-1-y, sy = x)
+                    sx = srcW - 1 - y;
+                    sy = x;
+                    break;
+                case 2:  // 右旋 90 度（顺时针）：目标(x,y) 来自源(sx = y, sy = srcH-1-x)
+                    sx = y;
+                    sy = srcH - 1 - x;
+                    break;
+                case 3:  // 180 度
+                    sx = srcW - 1 - x;
+                    sy = srcH - 1 - y;
+                    break;
+                default:
+                    sx = x;
+                    sy = y;
+                    break;
+            }
+            size_t si = (sy * srcW + sx) * 3;
+            size_t di = (y * dstW + x) * 3;
+            dst[di]     = src[si];
+            dst[di + 1] = src[si + 1];
+            dst[di + 2] = src[si + 2];
+        }
+    }
+
+    *outW = dstW;
+    *outH = dstH;
+    return true;
+}
+
+// 按 VISION_ROTATE_QUAD 旋转一张 JPEG。
+// 成功时返回新分配的 JPEG（调用方 free），并把尺寸写入 outW/outH。
+// 失败或无需旋转时返回 nullptr，调用方应继续使用原始帧。
+static uint8_t *rotateJpegIfNeeded(const uint8_t *jpeg, size_t jpegLen,
+                                   size_t srcW, size_t srcH,
+                                   size_t *outLen, size_t *outW, size_t *outH)
+{
+    if (VISION_ROTATE_QUAD == 0 || !jpeg || jpegLen == 0) return nullptr;
+    if (srcW == 0 || srcH == 0) return nullptr;
+    if ((size_t)srcW * srcH > (size_t)VISION_ROTATE_MAX_PIXELS) {
+        Serial.printf("Vision: [WARN] 分辨率 %ux%u 超出旋转上限，按原图上传\n",
+                      (unsigned)srcW, (unsigned)srcH);
+        return nullptr;
+    }
+
+    // 解码为 RGB888（PSRAM 优先）
+    uint8_t *rgb = (uint8_t *)ps_malloc((size_t)srcW * srcH * 3);
+    if (!rgb) rgb = (uint8_t *)malloc((size_t)srcW * srcH * 3);
+    if (!rgb) {
+        Serial.println("Vision: [WARN] 旋转解码缓冲区分配失败，按原图上传");
+        return nullptr;
+    }
+
+    if (!fmt2rgb888(jpeg, jpegLen, PIXFORMAT_JPEG, rgb)) {
+        free(rgb);
+        Serial.println("Vision: [WARN] 旋转解码失败，按原图上传");
+        return nullptr;
+    }
+
+    uint8_t *rotated = (uint8_t *)ps_malloc((size_t)srcW * srcH * 3);
+    if (!rotated) rotated = (uint8_t *)malloc((size_t)srcW * srcH * 3);
+    if (!rotated) {
+        free(rgb);
+        Serial.println("Vision: [WARN] 旋转输出缓冲区分配失败，按原图上传");
+        return nullptr;
+    }
+
+    size_t dstW = 0, dstH = 0;
+    if (!rotateRgb888(rgb, srcW, srcH, rotated, &dstW, &dstH, VISION_ROTATE_QUAD)) {
+        free(rgb);
+        free(rotated);
+        return nullptr;
+    }
+    free(rgb);
+
+    // 重新编码为 JPEG
+    uint8_t *outBuf = nullptr;
+    size_t outBufLen = 0;
+    bool ok = fmt2jpg(rotated, (size_t)dstW * dstH * 3, dstW, dstH,
+                      PIXFORMAT_RGB888, VISION_ROTATE_JPEG_QUALITY, &outBuf, &outBufLen);
+    free(rotated);
+
+    if (!ok || !outBuf || outBufLen == 0) {
+        if (outBuf) free(outBuf);
+        Serial.println("Vision: [WARN] 旋转后编码失败，按原图上传");
+        return nullptr;
+    }
+    if (outBufLen > VISION_MAX_IMAGE_BYTES) {
+        free(outBuf);
+        Serial.println("Vision: [WARN] 旋转后图片超出上限，按原图上传");
+        return nullptr;
+    }
+
+    *outLen = outBufLen;
+    if (outW) *outW = dstW;
+    if (outH) *outH = dstH;
+    Serial.printf("Vision: 已按 %u 度旋转，输出 %ux%u, %u 字节\n",
+                  (unsigned)(VISION_ROTATE_QUAD * 90),
+                  (unsigned)dstW, (unsigned)dstH, (unsigned)outBufLen);
+    return outBuf;
+}
+
 bool visionAcquireImage(const uint8_t **buf, size_t *len)
 {
     if (!g_imageLock) return false;
@@ -691,13 +824,27 @@ static bool performVisionRequestImpl(CamLockGuard &cam, const char *prompt)
     Serial.printf("Vision: 抓拍 %ux%u, %u 字节\n",
                   fb->width, fb->height, (unsigned)fb->len);
 
-    // 先把本次抓拍存下来，无论上传成功与否，网页都能看到对应图片
+    // 先把本次抓拍存下来，无论上传成功与否，网页都能看到对应图片。
+    // 这里存的是原始帧，保持 /vision/image 的既有行为。
     storeImage(fb->buf, fb->len);
 
+    // 送模型前做方向校正：外壳内摄像头是侧装的，原图与正常观看方向差 90 度，
+    // 不校正会让大模型看到横躺的药盒。旋转失败时退回原始帧，不影响识别流程。
+    size_t uploadLen = fb->len;
+    const uint8_t *uploadBuf = fb->buf;
+    uint8_t *rotatedJpeg = nullptr;
+    size_t rotatedW = 0, rotatedH = 0;
+    if (VISION_ROTATE_QUAD != 0) {
+        rotatedJpeg = rotateJpegIfNeeded(fb->buf, fb->len, fb->width, fb->height,
+                                         &uploadLen, &rotatedW, &rotatedH);
+        if (rotatedJpeg) uploadBuf = rotatedJpeg;
+    }
+
     size_t bodyLen = 0;
-    char *body = buildRequestBody(fb->buf, fb->len, prompt, &bodyLen);
-    esp_camera_fb_return(fb);          // 请求体已拷贝，尽快归还帧缓冲
-    cam.release();                     // 后面只剩网络传输，不再占用摄像头
+    char *body = buildRequestBody(uploadBuf, uploadLen, prompt, &bodyLen);
+    if (rotatedJpeg) free(rotatedJpeg);   // 请求体已拷贝，尽快释放
+    esp_camera_fb_return(fb);             // 请求体已拷贝，尽快归还帧缓冲
+    cam.release();                        // 后面只剩网络传输，不再占用摄像头
     if (!body) {
         return finishFailed("构造请求体失败");
     }

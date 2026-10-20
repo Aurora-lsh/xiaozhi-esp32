@@ -100,6 +100,9 @@ static unsigned mcpBridgePort() { return 8765; }
 constexpr int WL_CONNECTED = 3;
 constexpr int WIFI_AP = 2;
 constexpr int WIFI_AP_STA = 3;
+using WiFiEvent_t = int;
+constexpr int ARDUINO_EVENT_WIFI_AP_STACONNECTED = 12;
+constexpr int ARDUINO_EVENT_WIFI_AP_STADISCONNECTED = 13;
 struct FakeIp {
   String value = "192.168.1.55";
   FakeIp() = default;
@@ -117,6 +120,11 @@ struct WiFiFake {
   String apSsid;
   bool passwordWasNull = false;
   bool apDisconnected = false;
+  bool apStopSucceeds = true;
+  unsigned connectedStations = 0;
+  unsigned apStopCalls = 0;
+  template <typename Callback>
+  int onEvent(Callback, int) { return 0; }
   unsigned apConfigCalls = 0;
   unsigned apStartCalls = 0;
   int status() const { return online ? WL_CONNECTED : 0; }
@@ -133,7 +141,14 @@ struct WiFiFake {
   bool softAP(const char* ssid, const char* password, int, int, int) {
     ++apStartCalls; apSsid = ssid; passwordWasNull = password == nullptr; return apStarts;
   }
-  bool softAPdisconnect(bool) { apDisconnected = true; return true; }
+  bool softAPdisconnect(bool) {
+    ++apStopCalls;
+    if (!apStopSucceeds) return false;
+    apDisconnected = true;
+    connectedStations = 0;
+    return true;
+  }
+  unsigned softAPgetStationNum() const { return connectedStations; }
 } WiFi;
 static unsigned serverStarts = 0;
 static unsigned visionStarts = 0;
@@ -167,10 +182,13 @@ static void reset() {
   WiFi.apSsid = "";
   WiFi.passwordWasNull = false;
   WiFi.apDisconnected = false;
+  WiFi.apStopSucceeds = true;
+  WiFi.connectedStations = WiFi.apStopCalls = 0;
   WiFi.apConfigCalls = WiFi.apStartCalls = 0;
   cameraReady = false;
   provisioningMode = false;
-  provisioningManual = false;
+  provisioningLastActivityMs = 0;
+  provisioningMonitorStarted = false;
   networkServicesStarted = false;
   httpServerStarted = false;
   mcpStatusStarted = false;
@@ -252,7 +270,7 @@ int main() {
       loop();
       require(serverStarts == 1 && visionStarts == 1 && registrationStarts == 1,
               "STA reconnect did not activate services exactly once");
-      require(!provisioningMode && WiFi.apDisconnected, "open setup hotspot remained enabled after STA connected");
+      require(provisioningMode && !WiFi.apDisconnected, "STA connection prematurely closed boot hotspot");
       require(statusStarts == 1, "status cache initialized more than once");
     }},
     {"wifi_config command starts manual open hotspot without erasing settings", [] {
@@ -264,11 +282,114 @@ int main() {
       runSerialCommand("wifi_config");
       require(provisioningMode && WiFi.currentMode == WIFI_AP_STA && WiFi.passwordWasNull,
               "manual command did not open setup hotspot");
-      require(provisioningManual, "manual config mode was not marked manual");
       loop();
       require(provisioningMode && serverStarts == 1, "manual config mode disappeared or duplicated server");
       require(wifiSsid == savedSsid && writes == Preferences::writes && !ESP.restarted,
               "manual setup command erased credentials or restarted device");
+    }},
+    {"idle hotspot closes exactly twenty seconds after opening", [] {
+      currentMillis = 100;
+      startWifiConfigPortal();
+      currentMillis = 20099;
+      loop();
+      require(provisioningMode && WiFi.apStopCalls == 0, "startup grace period was shortened");
+      currentMillis = 20100;
+      loop();
+      require(!provisioningMode && WiFi.apStopCalls == 1, "idle hotspot did not close");
+      currentMillis = 70000;
+      loop();
+      require(WiFi.apStartCalls == 1, "offline STA automatically reopened expired hotspot");
+    }},
+    {"connected hotspot client stays online while STA connects", [] {
+      startWifiConfigPortal();
+      WiFi.connectedStations = 1;
+      currentMillis = 18000;
+      onWifiEvent(ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+      cameraReady = true;
+      WiFi.online = true;
+      currentMillis = 100000;
+      loop();
+      require(provisioningMode && WiFi.apStopCalls == 0, "connected AP client was disconnected by STA or timeout");
+      require(visionStarts == 1 && registrationStarts == 1, "STA services did not start alongside AP");
+    }},
+    {"last disconnect resets twenty second idle period", [] {
+      startWifiConfigPortal();
+      currentMillis = 1000;
+      WiFi.connectedStations = 2;
+      onWifiEvent(ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+      currentMillis = 50000;
+      WiFi.connectedStations = 1;
+      onWifiEvent(ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+      loop();
+      require(provisioningMode, "remaining client was ignored");
+      currentMillis = 60000;
+      WiFi.connectedStations = 0;
+      onWifiEvent(ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+      currentMillis = 79999;
+      loop();
+      require(provisioningMode, "last disconnect grace ended early");
+      currentMillis = 80000;
+      loop();
+      require(!provisioningMode && WiFi.apStopCalls == 1, "last disconnect timeout did not close AP");
+    }},
+    {"quick reconnect between main loop polls resets timeout", [] {
+      startWifiConfigPortal();
+      currentMillis = 19000;
+      onWifiEvent(ARDUINO_EVENT_WIFI_AP_STACONNECTED);
+      currentMillis = 19500;
+      onWifiEvent(ARDUINO_EVENT_WIFI_AP_STADISCONNECTED);
+      currentMillis = 39499;
+      loop();
+      require(provisioningMode, "short-lived client activity was lost");
+      currentMillis = 39500;
+      loop();
+      require(!provisioningMode, "short-lived client grace did not expire");
+    }},
+    {"wifi_config reopening obeys same idle timeout", [] {
+      startWifiConfigPortal();
+      currentMillis = 20000;
+      loop();
+      currentMillis = 30000;
+      runSerialCommand("wifi_config");
+      require(provisioningMode && WiFi.apStartCalls == 2 && serverStarts == 1, "manual reopening failed or duplicated HTTP server");
+      currentMillis = 49999;
+      loop();
+      require(provisioningMode, "manually reopened hotspot grace ended early");
+      currentMillis = 50000;
+      loop();
+      require(!provisioningMode && WiFi.apStopCalls == 2, "manual hotspot bypassed idle timeout");
+    }},
+    {"repeating wifi_config does not extend an active idle hotspot", [] {
+      startWifiConfigPortal();
+      currentMillis = 19000;
+      runSerialCommand("wifi_config");
+      currentMillis = 20000;
+      loop();
+      require(!provisioningMode && WiFi.apStartCalls == 1, "repeated command extended idle timeout");
+    }},
+    {"hotspot close failure retries without losing AP state", [] {
+      startWifiConfigPortal();
+      currentMillis = 20000;
+      WiFi.apStopSucceeds = false;
+      loop();
+      require(provisioningMode && WiFi.apStopCalls == 1, "close failure marked AP inactive");
+      currentMillis = 20999;
+      loop();
+      require(WiFi.apStopCalls == 1, "close retry was not throttled");
+      currentMillis = 21000;
+      WiFi.apStopSucceeds = true;
+      loop();
+      require(!provisioningMode && WiFi.apStopCalls == 2, "close retry failed");
+    }},
+    {"AP timeout handles millis wraparound", [] {
+      currentMillis = UINT32_MAX - 10000;
+      startWifiConfigPortal();
+      currentMillis = 9998;
+      loop();
+      require(provisioningMode, "clock wrap closed AP early");
+      currentMillis = 9999;
+      loop();
+      require(!provisioningMode, "clock wrap prevented AP timeout");
     }},
     {"hotspot works even when camera sensor initialization fails", [] {
       cameraReady = false;
